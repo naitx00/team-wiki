@@ -1,0 +1,19 @@
+# Links this folder to one person's Apps Script project — each person creates their own.
+.clasp.json
+
+# Names real people (the starting access list). Pushed to Apps Script by clasp,
+# never committed. See AccessSeed.gs.example.
+AccessSeed.gs
+
+# The organisation's name, logos and colours. Same as above: pushed to Apps
+# Script, never committed. See Brand.gs.example. The source logo files live
+# in dev/assets/ for the same reason.
+Brand.gs
+dev/assets/
+
+# Built by dev/build-preview.js.
+dev/preview.html
+
+node_modules/
+.DS_Store
+Thumbs.db

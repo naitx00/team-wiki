@@ -1,0 +1,14 @@
+/* AccessSeed.gs.example — copy to AccessSeed.gs (gitignored) and fill in.
+ *
+ * The access list the wiki starts with the first time it runs, before anyone
+ * has used the Settings page. Everyone in SEED_USERS gets all five
+ * permissions; SEED_ADMINS can also open Settings. Without this file, run
+ * setupAccess() once in the Apps Script editor to make yourself the first
+ * admin, then add people on the Settings page.
+ */
+const SEED_ADMINS = ['admin@example.com'];
+const SEED_USERS = [
+  'admin@example.com',
+  'teammate.one@example.com',
+  'teammate.two@example.com'
+];

@@ -1,0 +1,3937 @@
+<script>
+/* WikiClient.html
+ * OIS Team Wiki — the ToolHub wiki (assets/js/wiki/process-guides.js) running
+ * as a Google Apps Script web app. The UI is the hub's; only storage differs.
+ */
+// Pages live in a Google Drive folder and every read and write goes through
+// google.script.run (pgCall, in Helpers.html) to Code.gs / Api.gs.
+//
+// The page list arrives with the page itself (window.OIS_WIKI_BOOT) and holds
+// titles, folders and short snippets only. A page's content and its
+// highlights/comments are fetched when it is opened, and search runs on the
+// server — one imported Word document can be over a megabyte, too much to
+// ship the whole wiki up front.
+//
+// New pages and uploads are Google Docs, and existing Google Docs can be
+// linked in (a Drive shortcut; the Doc stays where it is). The wiki shows a
+// Doc in Google's own viewer, so it looks exactly as it does in Docs, and
+// sends "Edit" to Google Docs. Older .html/.md pages
+// keep the wiki's own editor, highlights and comments.
+//
+// Who may edit is decided on the server (Script Property EDITORS and Drive
+// sharing); the client only hides the controls to match.
+window.OIS_WIKI_STARTED = true;
+(function () {
+  const BOOT = window.OIS_WIKI_BOOT || {};
+  let PG_SPACE = (BOOT.tree && BOOT.tree.space) || 'OIS Team Wiki';
+  const pgUser = BOOT.user || { email: '', canEdit: false };
+
+  let pgPages = [];
+  let pgCurrent = null;
+  let pgEditing = false;
+  let pgShowingToc = false;
+  let pgShowingHome = false;    // the welcome page is on screen
+  let pgShowResolved = false;
+  let pgTurndown = null;
+  let pgGlobalBound = false;
+  let pgPendingComment = null;
+  let pgLoaded = false;
+
+  // The organisation's name (Brand.gs), for "your … Google account".
+  const PG_BRAND = BOOT.brand || { name: 'Team Wiki', org: '' };
+  const PG_ACCOUNT = (PG_BRAND.org ? PG_BRAND.org + ' ' : 'work ') + 'Google account';
+
+  // What this person may do, as set on the Settings page (Access.gs):
+  // add, edit, upload, link, delete. The server checks each one again.
+  function pgCan(perm) {
+    if (!pgUser.email) return false;
+    if (pgUser.perms) return !!pgUser.perms[perm];
+    return !!pgUser.canEdit;                        // older server: one switch for all
+  }
+  function pgReadOnlyReason() {
+    if (!pgUser.email) return 'signedout';
+    if (!pgUser.canEdit) return 'viewer';
+    return null;
+  }
+  // True when the person may change anything at all.
+  function pgCanEdit() { return !pgReadOnlyReason(); }
+  const PG_PERM_WORDS = { add: 'create pages or folders', edit: 'edit pages', upload: 'upload files',
+                          link: 'link files', delete: 'delete pages or folders' };
+  function pgRequire(perm) {
+    const who = (pgUser.contact && pgUser.contact[0]) || 'a wiki admin';
+    pgToast(!pgUser.email
+      ? 'Sign in with your ' + PG_ACCOUNT + ' to make changes'
+      : "You don't have permission to " + (PG_PERM_WORDS[perm] || 'do that') + ' — ask ' + who, 6000);
+    return false;
+  }
+
+  // ── Storage ─────────────────────────────────────────────
+  const PG_ROOT_FOLDER = 'All pages';   // label for pages sitting loose in the root folder
+  let pgFolder = '';         // subfolder currently being browsed ('' = top level)
+  let pgFolderList = [];     // every subfolder in Drive, including empty ones
+
+  // A page row from the server — metadata only. `content` and `annotations`
+  // stay null until the page is opened (pgEnsureContent). Doc pages never
+  // fetch content: Google's viewer shows them (pgDocPreviewUrl).
+  function pgPageFromRow(row) {
+    const doc = row.kind === 'gdoc' || row.kind === 'link';
+    return {
+      id: row.id,
+      kind: row.kind || 'html',     // 'html' | 'gdoc' | 'link' (see Docs.gs)
+      app: row.app || 'doc',        // for gdoc/link: 'doc' | 'sheet' | 'slide'
+      office: row.office || null,   // 'pptx', 'docx', … for an Office file kept as-is
+      docId: row.docId || null,
+      docUrl: row.docUrl || null,
+      broken: !!row.broken,
+      path: row.path,
+      file: row.file,
+      folder: row.folder || '',
+      title: row.title || pgTitleFromFilename(row.file),
+      snippet: row.snippet || '',
+      rev: row.rev || 0,
+      modified: row.modified || 0,
+      space: PG_SPACE,
+      content: doc ? '' : null,
+      annotations: doc ? { highlights: [], comments: [] } : null
+    };
+  }
+
+  // Fetches a page's content and annotations the first time it is needed.
+  // Concurrent callers share one request.
+  function pgEnsureContent(page) {
+    if (page.content !== null && page.annotations) return Promise.resolve(page);
+    if (!page._loading) {
+      page._loading = pgCall('getPage', page.id).then(data => {
+        page.content = data.content;
+        page.annotations = data.annotations || { highlights: [], comments: [] };
+        if (data.snippet !== undefined) page.snippet = data.snippet;
+        page.rev = data.rev;
+        page.modified = data.modified;
+        page._loading = null;
+        return page;
+      }, err => { page._loading = null; throw err; });
+    }
+    return page._loading;
+  }
+
+  // Every folder: those in Drive (even empty ones) plus any a page lives in.
+  // Root always first.
+  function pgFolders() {
+    const set = new Set(['']);
+    pgFolderList.forEach(f => set.add(f));
+    pgPages.forEach(p => set.add(p.folder || ''));
+    return Array.from(set).sort((a, b) => {
+      if (a === '') return -1;
+      if (b === '') return 1;
+      return a.localeCompare(b);
+    });
+  }
+  function pgFolderLabel(folder) {
+    return folder ? folder.split('/').pop() : PG_ROOT_FOLDER;
+  }
+
+  // ── Collapse state for the folder list ──────────────────
+  // Remembered per browser so the sidebar looks the same on the next visit.
+  const PG_UI_KEY = 'ois-toolhub-wiki-folder-ui';
+  let pgFoldersCollapsed = true;   // accordion starts closed — one row, not a wall
+  let pgCollapsed = {};            // folder path -> true when its children are hidden
+  let pgFolderFilter = '';         // not persisted; clears when a folder is picked
+  (function pgLoadFolderUi() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(PG_UI_KEY) || '{}');
+      if (typeof saved.sectionCollapsed === 'boolean') pgFoldersCollapsed = saved.sectionCollapsed;
+      pgCollapsed = saved.collapsed && typeof saved.collapsed === 'object' ? saved.collapsed : {};
+    } catch (e) { /* first run */ }
+  })();
+  function pgSaveFolderUi() {
+    try {
+      localStorage.setItem(PG_UI_KEY, JSON.stringify({
+        sectionCollapsed: pgFoldersCollapsed, collapsed: pgCollapsed
+      }));
+    } catch (e) { /* quota/private mode */ }
+  }
+  // True when some ancestor of this folder is collapsed.
+  function pgFolderHidden(folder) {
+    if (!folder) return false;
+    const parts = folder.split('/');
+    for (let i = 1; i < parts.length; i++) {
+      if (pgCollapsed[parts.slice(0, i).join('/')]) return true;
+    }
+    return false;
+  }
+  function pgFolderHasChildren(folder, all) {
+    if (!folder) return false;
+    return all.some(f => f.indexOf(folder + '/') === 0);
+  }
+
+  // Google Doc pages (made here or linked in) are edited in Google Docs, not
+  // in the wiki's editor, and use Docs comments instead of the wiki's.
+  function pgIsDocPage(p) { return !!p && (p.kind === 'gdoc' || p.kind === 'link'); }
+
+  // Google's own read-only viewer for a Doc. It is the same renderer Google
+  // Docs uses, so fonts, spacing, page size, margins, headers, footers and
+  // images all match — an HTML export can't. It shows the Doc with the
+  // reader's own Google access.
+  const PG_APP_INFO = {
+    doc:   { path: 'document',     noun: 'Doc',         name: 'Google Doc',    icon: 'doc' },
+    sheet: { path: 'spreadsheets', noun: 'Sheet',       name: 'Google Sheet',  icon: 'sheet' },
+    slide: { path: 'presentation', noun: 'Slides file', name: 'Google Slides', icon: 'slide' }
+  };
+  function pgAppInfo(p) { return PG_APP_INFO[(p && p.app) || 'doc'] || PG_APP_INFO.doc; }
+  const PG_OFFICE_NOUN = { docx: 'Word file', doc: 'Word file', xlsx: 'Excel file', xls: 'Excel file',
+                           pptx: 'PowerPoint file', ppt: 'PowerPoint file' };
+  // What to call the file in messages: "Doc", "Sheet", "PowerPoint file"…
+  function pgNoun(p) { return (p && p.office && PG_OFFICE_NOUN[p.office]) || pgAppInfo(p).noun; }
+  // Office files (a .pptx kept as-is) use Drive's file viewer — Google's
+  // Slides/Docs/Sheets viewers only show native files.
+  function pgDocPreviewUrl(p) {
+    if (p.office) return 'https://drive.google.com/file/d/' + encodeURIComponent(p.docId) + '/preview';
+    return 'https://docs.google.com/' + pgAppInfo(p).path + '/d/' + encodeURIComponent(p.docId) + '/preview';
+  }
+  // The real Google editor (Docs, Sheets or Slides), embedded. Google saves
+  // as you type. Office files open in its Office-compatibility mode, which
+  // saves back into the .pptx/.docx/.xlsx itself.
+  function pgDocEditUrl(p) {
+    return 'https://docs.google.com/' + pgAppInfo(p).path + '/d/' + encodeURIComponent(p.docId) + '/edit' +
+      (p.office ? '?rtpof=true&sd=true' : '');
+  }
+  let pgDocInline = false;   // the open Doc is showing the embedded editor
+
+  // Server errors arrive as Error objects whose message is already written for
+  // the reader (see guard_ in Api.gs).
+  function pgErrMsg(err) {
+    return String(err && err.message || err || 'unknown error').replace(/^(Exception|Error):\s*/, '');
+  }
+
+  function pgGenId() { return 'id-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 9); }
+  // Produces a safe, URL-friendly, lowercase kebab-case filename stem. Strips
+  // characters that are illegal on Windows or awkward in URLs (& ( ) etc.) and
+  // collapses runs of separators, so uploads can't create names like
+  // "e-&-a-consulting-group-(1).md".
+  function pgSlugify(name) {
+    return String(name || '')
+      .trim()
+      .toLowerCase()
+      .replace(/[\\/:*?\x22<>|]/g, '')       // illegal on Windows
+      .replace(/[&+#%{}$!\x27\x60~^]/g, '')     // awkward in URLs
+      .replace(/[()\[\]]/g, '')           // brackets
+      .replace(/[\s_.]+/g, '-')           // spaces, underscores, dots -> dash
+      .replace(/-{2,}/g, '-')             // collapse runs
+      .replace(/^-+|-+$/g, '')            // trim dashes
+      || 'untitled';
+  }
+  // Strips a trailing document extension from a title. Pages imported before
+  // extensions were stripped at upload time still have e.g. "Handbook.pdf" as
+  // their heading, so clean it on read too rather than rewriting those files.
+  function pgCleanTitle(t) {
+    return String(t || '').replace(/\.(html?|md|markdown|docx?|pdf|txt|rtf|xlsx?|pptx?)$/i, '').trim();
+  }
+  // A page's title is its first heading — written as Markdown for most pages,
+  // or as an <h1> for Word documents, which are stored as HTML.
+  function pgTitleFromContent(content, fallback) {
+    const text = String(content || '');
+    const md = text.match(/^\s*#\s+(.+)$/m);
+    if (md) return pgCleanTitle(md[1].trim());
+    const h1 = text.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+    if (h1) {
+      const plain = h1[1].replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
+      if (plain) return pgCleanTitle(plain);
+    }
+    return fallback;
+  }
+
+  // ── Manual page ordering (drag to reorder in the sidebar) ──
+  // Stores an explicit list of page paths in localStorage. Pages not in the
+  // list (newly added/uploaded) fall to the end in alphabetical order, so a
+  // saved order never hides a new page.
+  const PG_ORDER_KEY = 'ois-toolhub-wiki-page-order';
+  function pgLoadOrder() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(PG_ORDER_KEY) || '[]');
+      return Array.isArray(raw) ? raw : [];
+    } catch (e) { return []; }
+  }
+  function pgSaveOrder(paths) {
+    try { localStorage.setItem(PG_ORDER_KEY, JSON.stringify(paths)); } catch (e) { /* quota/private mode */ }
+  }
+  function pgSortPages() {
+    const order = pgLoadOrder();
+    const rank = {};
+    order.forEach((p, i) => { rank[p] = i; });
+    pgPages.sort((a, b) => {
+      const ra = rank[a.path], rb = rank[b.path];
+      if (ra !== undefined && rb !== undefined) return ra - rb;
+      if (ra !== undefined) return -1;
+      if (rb !== undefined) return 1;
+      return a.title.localeCompare(b.title);
+    });
+  }
+  // Strips any file extension (.md, .docx, .pdf, .txt, …) so uploaded documents
+  // don't carry their extension into the page title.
+  function pgTitleFromFilename(name) {
+    return String(name || '')
+      .replace(/\.[A-Za-z0-9]{1,8}$/, '')
+      .replace(/[-_]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+  function pgTruncate(s, n) { return s.length > n ? s.slice(0, n) + '…' : s; }
+  function pgFmtTime(ts) { try { return new Date(ts).toLocaleString(); } catch (e) { return ''; } }
+
+  // `ms` lets errors linger — a 2-second toast is easy to miss, and a failure
+  // that vanishes looks exactly like a success.
+  function pgToast(msg, ms) {
+    const t = document.getElementById('wgtToast');
+    if (!t) return;
+    t.textContent = msg;
+    t.classList.add('wgt-show');
+    clearTimeout(pgToast._t);
+    pgToast._t = setTimeout(() => t.classList.remove('wgt-show'), ms || 2200);
+  }
+
+  // Shared sanitiser settings: allow the inline styling, embedded media and
+  // data-URI images the editor can produce, while DOMPurify still strips scripts
+  // and event handlers.
+  //
+  // `style` is in ADD_TAGS because an imported Word document carries its own
+  // stylesheet — that is what makes the page look like the original. DOMPurify
+  // parses and sanitises CSS itself, so no script can ride in on it, and
+  // docx-preview scopes every rule under .wdoc so a document can't restyle the
+  // hub around it.
+  const PG_SANITIZE = {
+    // iframe stays allowed for the Insert > media embeds; frames without a real
+    // https source are stripped in pgContentToHtml instead.
+    ADD_TAGS: ['iframe', 'video', 'audio', 'source', 'style'],
+    ADD_ATTR: ['style', 'class', 'target', 'allowfullscreen', 'frameborder', 'controls', 'colspan', 'rowspan'],
+    ADD_DATA_URI_TAGS: ['img']
+  };
+
+  async function pgLoadViewLibs() {
+    await Promise.all([
+      loadScriptOnce('https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js'),
+      loadScriptOnce('https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js'),
+    ]).catch(() => {});
+    if (window.marked) marked.setOptions({ breaks: true, gfm: true });
+  }
+  async function pgLoadTurndownLib() {
+    await loadScriptOnce('https://cdnjs.cloudflare.com/ajax/libs/turndown/7.1.2/turndown.js').catch(() => {});
+    if (window.TurndownService && !pgTurndown) {
+      pgTurndown = new TurndownService({ headingStyle: 'atx' });
+      // Preserve anything with inline styling (color/font/size/spacing/alignment
+      // applied from the rich-text editor toolbar) as raw HTML — Markdown has no
+      // syntax for these, so round-tripping through the editor keeps them intact.
+      pgTurndown.keep((node) => !!(node.getAttribute && node.getAttribute('style')));
+      // Embedded media has no Markdown equivalent — keep it as raw HTML.
+      pgTurndown.keep(['u', 'iframe', 'video', 'audio', 'source']);
+      pgTurndown.addRule('strikethrough', {
+        filter: ['strike', 's', 'del'],
+        replacement: (content) => '~~' + content + '~~'
+      });
+      // Tables: emit a clean GitHub-style pipe table when the table is simple,
+      // otherwise keep the original HTML so merged cells and cell styling survive.
+      pgTurndown.addRule('table', {
+        filter: 'table',
+        replacement: (content, node) => '\n\n' + pgTableToMarkdown(node) + '\n\n'
+      });
+      // Wiki links render as <a data-wikilink="..."> — convert them back to
+      // [[Target]] / [[Target|Label]] syntax instead of a plain markdown link.
+      pgTurndown.addRule('wikilink', {
+        filter: (node) => node.nodeName === 'A' && node.hasAttribute('data-wikilink'),
+        replacement: (content, node) => {
+          const target = decodeURIComponent(node.getAttribute('data-wikilink') || '');
+          const label = (content || '').trim();
+          return label && label.toLowerCase() !== target.toLowerCase() ? `[[${target}|${label}]]` : `[[${target}]]`;
+        }
+      });
+    }
+  }
+  async function pgLoadUploadLibs() {
+    await Promise.all([
+      pgLoadTurndownLib(),
+      loadScriptOnce('https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js'),
+      loadScriptOnce('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'),
+    ]);
+    if (window.pdfjsLib) {
+      pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    }
+  }
+
+  // ── Pages + annotations ─────────────────────────────────
+  async function pgSaveAnnotations(page) {
+    if (!pgCan('edit')) return;
+    try {
+      await pgCall('saveAnnotations', page.id, page.annotations);
+    } catch (err) {
+      console.error(err);
+      pgToast("Couldn't save comments/highlights: " + pgErrMsg(err), 7000);
+    }
+  }
+
+  // Loads the folder and page list. The first call uses the list that came
+  // with the page; later calls (`fresh`, or any quiet refresh) ask Drive again.
+  async function pgLoadPages(opts) {
+    const quiet = opts && opts.quiet;
+    let data = null;
+    if (!pgLoaded && BOOT.tree && !(opts && opts.fresh)) {
+      data = BOOT.tree;
+    } else {
+      try {
+        data = await pgCall('listTree');
+      } catch (err) {
+        console.error(err);
+        if (quiet) return;          // keep showing what we have
+        pgShowLoadError(pgErrMsg(err));
+        return;
+      }
+    }
+    if (!data) { pgShowLoadError(BOOT.error || 'The wiki could not be loaded.'); return; }
+    PG_SPACE = data.space || PG_SPACE;
+
+    // Update pages already known in place, so pgCurrent and anything else
+    // holding a page stays valid. Content is dropped (and fetched again when
+    // next opened) only when someone has changed the page since — except the
+    // page being edited, whose revision is what detects that on save.
+    const known = {};
+    pgPages.forEach(p => { known[p.id] = p; });
+    pgPages = (data.pages || []).map(row => {
+      const fresh = pgPageFromRow(row);
+      const old = known[row.id];
+      if (!old) return fresh;
+      const editingThis = pgEditing && old === pgCurrent;
+      const changed = old.rev !== fresh.rev || old.modified !== fresh.modified;
+      Object.assign(old, { path: fresh.path, file: fresh.file, folder: fresh.folder,
+                           title: fresh.title, snippet: fresh.snippet });
+      if (changed && !editingThis) {
+        Object.assign(old, { rev: fresh.rev, modified: fresh.modified });
+        if (!pgIsDocPage(old)) Object.assign(old, { content: null, annotations: null });
+      }
+      return old;
+    });
+    pgFolderList = (data.folders || []).filter(Boolean);
+    // Stay on a folder that still exists.
+    if (pgFolder && pgFolders().indexOf(pgFolder) === -1) pgFolder = '';
+    pgLoaded = true;
+    pgSortPages();
+    pgRenderSidebar(pgSearchValue());
+    pgApplyPermissions();
+    const search = document.getElementById('wgtSearch');
+    if (search) search.disabled = false;
+    if (quiet) {
+      // Background refresh — stay on whatever the reader was looking at, and
+      // never disturb an edit in progress.
+      if (pgEditing || pgSearchValue()) return;     // don't pull the reader off results
+      if (pgShowingToc) { pgRenderTableOfContents(pgFolder); return; }
+      if (pgCurrent && pgPages.includes(pgCurrent)) {
+        if (pgCurrent.content === null) pgOpenPage(pgCurrent);   // changed by someone else
+      }
+      else pgShowHome();          // home, or the open page is gone
+      return;
+    }
+    pgShowHome();
+  }
+
+  function pgSearchValue() {
+    const s = document.getElementById('wgtSearch');
+    return s ? s.value : '';
+  }
+
+  function pgShowLoadError(msg) {
+    const contentEl = document.getElementById('wgtContent');
+    const sidebarEl = document.getElementById('wgtSidebar');
+    if (sidebarEl) sidebarEl.innerHTML = `<div class="wgt-empty-hint">No pages loaded.</div>`;
+    if (!contentEl) return;
+    contentEl.innerHTML = `
+      <div class="wgt-welcome">
+        <h3>Couldn't load the wiki</h3>
+        <p class="wgt-upload-fail">${esc(msg)}</p>
+        <button class="wgt-btn wgt-primary" id="wgtRetryLoad">Try again</button>
+      </div>`;
+    const retry = document.getElementById('wgtRetryLoad');
+    if (retry) retry.addEventListener('click', () => pgLoadPages({ fresh: true }));
+  }
+
+  // Shows or hides everything that changes content, based on the account.
+  function pgApplyPermissions() {
+    const can = pgCanEdit();
+    const shell = document.getElementById('wgtShell');
+    if (shell) shell.classList.toggle('wgt-readonly', !can);
+
+    const needs = { wgtNewPageBtn: 'add', wgtNewFolderBtn: 'add', wgtUploadBtn: 'upload', wgtLinkDocBtn: 'link' };
+    Object.keys(needs).forEach(id => {
+      const b = document.getElementById(id);
+      if (!b) return;
+      const ok = pgCan(needs[id]);
+      b.style.display = ok ? '' : 'none';
+      b.disabled = !ok || !pgLoaded;
+    });
+    const note = document.getElementById('wgtReadonlyNote');
+    if (note) note.style.display = can ? 'none' : '';
+    // The grouped buttons disappear as a group when none of them apply.
+    const group = document.getElementById('wkEditTools');
+    if (group) group.style.display = (pgCan('add') || pgCan('upload') || pgCan('link')) ? '' : 'none';
+    const cmt = document.getElementById('wgtCommentsToggleBtn');
+    if (cmt) cmt.disabled = !pgLoaded;
+    const editBtn = document.getElementById('wgtEditBtn');
+    if (editBtn) editBtn.style.display = pgCan('edit') ? '' : 'none';
+    const delBtn = document.getElementById('wgtDeleteBtn');
+    if (delBtn) delBtn.style.display = pgCan('delete') ? '' : 'none';
+    const settings = document.getElementById('wkSettingsBtn');
+    if (settings) settings.style.display = pgUser.isAdmin ? '' : 'none';
+    const sidebar = document.getElementById('wgtSidebar');
+    if (sidebar) pgInitSidebarSortable(sidebar, !pgCan('edit'));
+  }
+
+  // ── Settings (admins): who can open the wiki and what each person may do ──
+  // Edited in memory, saved in one go (saveSettings in Access.gs).
+  const PG_PERM_LABELS = [
+    ['add', 'Add', 'Create pages and folders'],
+    ['edit', 'Edit', 'Edit pages and Google files, move pages, rename folders, highlight and comment'],
+    ['upload', 'Upload', 'Upload Word, Excel, PowerPoint, PDF…'],
+    ['link', 'Link', 'Link existing Google or Office files'],
+    ['delete', 'Delete', 'Delete pages and folders, remove links']
+  ];
+  let pgSettings = null;         // { viewers, people: [{ email, admin, perms }], domain, me }
+  let pgSettingsDirty = false;
+
+  async function pgShowSettings() {
+    if (!pgUser.isAdmin) return;
+    pgExitDocMax();
+    const contentEl = document.getElementById('wgtContent');
+    if (!contentEl) return;
+    pgShowingHome = false; pgShowingToc = false; pgCurrent = null; pgEditing = false; pgDocInline = false;
+    pgHideCommentsPanel();
+    contentEl.classList.remove('wgt-content-doc');
+    contentEl.innerHTML = '<div class="wk-settings"><div class="wgt-empty-hint">Loading settings…</div></div>';
+    pgRenderSidebar(pgSearchValue());
+    try {
+      pgSettings = await pgCall('getSettings');
+      pgSettingsDirty = false;
+      pgRenderSettings();
+    } catch (err) {
+      contentEl.innerHTML = `<div class="wgt-welcome"><h3>Couldn't open settings</h3><p class="wgt-upload-fail">${esc(pgErrMsg(err))}</p></div>`;
+    }
+  }
+
+  function pgRenderSettings() {
+    const contentEl = document.getElementById('wgtContent');
+    if (!contentEl || !pgSettings) return;
+    const st = pgSettings;
+    const people = st.people;
+    const colAll = key => people.length && people.every(p => p.admin || p.perms[key]);
+    contentEl.innerHTML = `
+      <div class="wk-settings">
+        <div class="wgt-page-header">
+          <div class="wk-title"><span class="wk-kind wk-kind-page">${PG_ICONS.gear}</span>
+            <div class="wk-title-text"><h2>Settings</h2></div></div>
+          <div class="wgt-page-actions">
+            <span class="wk-settings-dirty"${pgSettingsDirty ? '' : ' hidden'}>Unsaved changes</span>
+            <button type="button" class="wk-pa-ghost" id="wkSetRevert"${pgSettingsDirty ? '' : ' disabled'}>Discard</button>
+            <button type="button" class="wk-pa-primary" id="wkSetSave"${pgSettingsDirty ? '' : ' disabled'}>${PG_ICONS.check}<span>Save</span></button>
+          </div>
+        </div>
+
+        <section class="wk-set-card">
+          <h3>Who can open the wiki</h3>
+          <label class="wk-radio"><input type="radio" name="wkViewers" value="listed"${st.viewers !== 'domain' ? ' checked' : ''}>
+            <span><strong>Only the people below</strong><small>Everyone else sees a “no access” page.</small></span></label>
+          <label class="wk-radio"><input type="radio" name="wkViewers" value="domain"${st.viewers === 'domain' ? ' checked' : ''}>
+            <span><strong>Anyone at ${esc(st.domain || 'the organisation')}</strong><small>Can read and search. Only the people below can change anything.</small></span></label>
+        </section>
+
+        <section class="wk-set-card">
+          <div class="wk-set-head">
+            <h3>People and permissions <span class="wk-set-count">${people.length}</span></h3>
+            <form class="wk-set-add" id="wkSetAdd" autocomplete="off">
+              <input type="email" id="wkSetEmail" placeholder="name@${esc(st.domain || 'example.com')}" required />
+              <button type="submit" class="wk-pa-primary">${PG_ICONS.plus}<span>Add person</span></button>
+            </form>
+          </div>
+          <div class="wk-set-table-wrap">
+          <table class="wk-set-table">
+            <thead><tr>
+              <th class="wk-set-person">Person</th>
+              <th title="Admins manage these settings and can do everything">Admin</th>
+              ${PG_PERM_LABELS.map(([k, label, tip]) => `<th title="${esc(tip)}">
+                <button type="button" class="wk-set-col" data-col="${k}" title="${colAll(k) ? 'Untick' : 'Tick'} ${label} for everyone">${label}</button></th>`).join('')}
+              <th></th>
+            </tr></thead>
+            <tbody>
+              ${people.map((p, i) => {
+                const me = p.email === st.me;
+                return `<tr${p.admin ? ' class="wk-set-admin"' : ''}>
+                  <td class="wk-set-person"><div class="wk-set-who"><span class="wk-avatar wk-avatar-sm">${esc(p.email.charAt(0).toUpperCase())}</span>
+                    <span class="wk-set-email">${esc(p.email)}${me ? ' <em>(you)</em>' : ''}</span></div></td>
+                  <td><input type="checkbox" data-i="${i}" data-admin="1"${p.admin ? ' checked' : ''}${me ? ' disabled title="You can\u2019t remove your own admin access"' : ''}></td>
+                  ${PG_PERM_LABELS.map(([k]) => `<td><input type="checkbox" data-i="${i}" data-perm="${k}"${p.admin || p.perms[k] ? ' checked' : ''}${p.admin ? ' disabled title="Admins can do everything"' : ''}></td>`).join('')}
+                  <td>${me ? '' : `<button type="button" class="wk-pa wk-pa-danger" data-remove="${i}" title="Remove ${esc(p.email)}" aria-label="Remove">${PG_ICONS.trash}</button>`}</td>
+                </tr>`;
+              }).join('')}
+            </tbody>
+          </table>
+          </div>
+          <p class="wk-set-legend">${PG_PERM_LABELS.map(([, label, tip]) => `<span><strong>${label}</strong> — ${esc(tip)}</span>`).join('')}</p>
+        </section>
+      </div>`;
+
+    const dirty = () => { pgSettingsDirty = true; pgRenderSettings(); };
+    contentEl.querySelectorAll('input[name="wkViewers"]').forEach(r => r.addEventListener('change', () => { st.viewers = r.value; dirty(); }));
+    contentEl.querySelectorAll('input[data-perm]').forEach(cb => cb.addEventListener('change', () => {
+      people[+cb.dataset.i].perms[cb.dataset.perm] = cb.checked; dirty();
+    }));
+    contentEl.querySelectorAll('input[data-admin]').forEach(cb => cb.addEventListener('change', () => {
+      const p = people[+cb.dataset.i];
+      p.admin = cb.checked;
+      if (p.admin) PG_PERM_LABELS.forEach(([k]) => { p.perms[k] = true; });
+      dirty();
+    }));
+    contentEl.querySelectorAll('[data-col]').forEach(b => b.addEventListener('click', () => {
+      const k = b.dataset.col, on = !colAll(k);
+      people.forEach(p => { if (!p.admin) p.perms[k] = on; });
+      dirty();
+    }));
+    contentEl.querySelectorAll('[data-remove]').forEach(b => b.addEventListener('click', () => {
+      people.splice(+b.dataset.remove, 1); dirty();
+    }));
+    const add = document.getElementById('wkSetAdd');
+    if (add) add.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const input = document.getElementById('wkSetEmail');
+      const email = String(input.value || '').trim().toLowerCase();
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) { pgToast('That isn\u2019t an email address'); return; }
+      if (people.some(p => p.email === email)) { pgToast(email + ' is already on the list'); return; }
+      const perms = {};
+      PG_PERM_LABELS.forEach(([k]) => { perms[k] = true; });
+      people.push({ email, admin: false, perms });
+      people.sort((a, b) => a.email.localeCompare(b.email));
+      dirty();
+      const again = document.getElementById('wkSetEmail');
+      if (again) again.focus();
+    });
+    const revert = document.getElementById('wkSetRevert');
+    if (revert) revert.addEventListener('click', () => pgShowSettings());
+    const save = document.getElementById('wkSetSave');
+    if (save) save.addEventListener('click', async () => {
+      save.disabled = true;
+      save.innerHTML = '<span>Saving…</span>';
+      try {
+        pgSettings = await pgCall('saveSettings', { viewers: st.viewers, people: people });
+        pgSettingsDirty = false;
+        pgRenderSettings();
+        pgToast('Settings saved');
+      } catch (err) {
+        console.error(err);
+        pgToast("Couldn't save: " + pgErrMsg(err), 8000);
+        pgRenderSettings();
+      }
+    });
+  }
+
+  // Shown instead of the wiki to people who aren't on the access list.
+  function pgShowDenied(container) {
+    const who = (pgUser.contact && pgUser.contact[0]) || '';
+    container.innerHTML = `
+      <div class="wk-denied">
+        <span class="wk-kind wk-kind-page">${PG_ICONS.lock}</span>
+        <h1>You don't have access yet</h1>
+        <p>${pgUser.email
+          ? `<strong>${esc(pgUser.email)}</strong> isn't on ${esc(PG_BRAND.name)}'s access list.`
+          : 'Sign in with your ' + esc(PG_ACCOUNT) + ' to open ' + esc(PG_BRAND.name) + '.'}</p>
+        ${who && pgUser.email ? `<p>Ask <a href="mailto:${esc(who)}?subject=${encodeURIComponent('Access to ' + PG_BRAND.name)}">${esc(who)}</a> to add you.</p>` : ''}
+      </div>`;
+  }
+
+  // ── Home: shown on first visit, on refresh, and from the logo ──
+  const PG_PHRASES = [
+    'Everything the OIS team knows, in one place.',
+    'Playbooks, guides and workbooks — one search away.',
+    'Write it once. Share it with the whole team.',
+    'Good docs make great handoffs.',
+    'Find it fast, fix it faster.',
+    'Today’s notes are tomorrow’s playbook.',
+    'Ask the wiki before you ask the channel.'
+  ];
+  const PG_TIPS = [
+    () => `Press <kbd>${/Mac|iPhone|iPad/.test(navigator.platform || '') ? '⌘' : 'Ctrl'} K</kbd> anywhere to search every page, Doc, Sheet and Slides file.`,
+    () => 'Drag a page in the sidebar onto a folder to move it there.',
+    () => '<strong>Link</strong> adds a Google file that lives elsewhere — removing the link never deletes the file.',
+    () => '<strong>✎ Edit</strong> opens Google Docs, Sheets or Slides right here — no new tab needed.',
+    () => 'The number on the 💬 button is how many comments are still open on that page.',
+    () => 'Upload Word, Excel or PowerPoint and Google turns it into a Doc, Sheet or Slides.'
+  ];
+  let pgPhraseTimer = null;
+
+  function pgFirstName() {
+    const local = String(pgUser.email || '').split('@')[0].split(/[._-]/)[0];
+    return local ? local.charAt(0).toUpperCase() + local.slice(1) : '';
+  }
+  function pgGreeting() {
+    const h = new Date().getHours();
+    const part = h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening';
+    const name = pgFirstName();
+    return name ? part + ', ' + name : part;
+  }
+  function pgAgo(ms) {
+    if (!ms) return '';
+    const mins = Math.round((Date.now() - ms) / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return mins + ' min ago';
+    const hrs = Math.round(mins / 60);
+    if (hrs < 24) return hrs + ' h ago';
+    const days = Math.round(hrs / 24);
+    if (days < 30) return days + (days === 1 ? ' day ago' : ' days ago');
+    return new Date(ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+  }
+
+  function pgShowHome() {
+    const contentEl = document.getElementById('wgtContent');
+    if (!contentEl) return;
+    pgExitDocMax();
+    pgShowingHome = true;
+    pgShowingToc = false;
+    pgCurrent = null;
+    pgEditing = false;
+    pgDocInline = false;
+    pgFindClose();
+    pgHideCommentsPanel();
+    contentEl.classList.remove('wgt-content-doc');
+    const can = pgCanEdit();
+
+    const recent = pgPages.slice().sort((a, b) => (b.modified || 0) - (a.modified || 0)).slice(0, 6);
+    const count = pred => pgPages.filter(pred).length;
+    const stats = [
+      { cls: 'doc', icon: 'doc', n: count(p => p.kind !== 'html' && (p.app || 'doc') === 'doc'), label: 'Docs' },
+      { cls: 'sheet', icon: 'sheet', n: count(p => p.kind !== 'html' && p.app === 'sheet'), label: 'Sheets' },
+      { cls: 'slide', icon: 'slide', n: count(p => p.kind !== 'html' && p.app === 'slide'), label: 'Slides' },
+      { cls: 'page', icon: 'page', n: count(p => p.kind === 'html'), label: 'Wiki pages' }
+    ];
+    const folders = pgFolders().length - 1;
+    const start = Math.floor(Math.random() * PG_PHRASES.length);
+    const tip = PG_TIPS[Math.floor(Math.random() * PG_TIPS.length)]();
+
+    contentEl.innerHTML = `
+      <div class="wk-home" id="wkHomePage">
+        <section class="wk-home-hero">
+          <div class="wk-home-eyebrow">${esc(PG_BRAND.name)}</div>
+          <h1>${esc(pgGreeting())}</h1>
+          <p class="wk-home-phrase" id="wkPhrase">${esc(PG_PHRASES[start])}</p>
+          <label class="wk-home-search" for="wkHomeSearch">
+            ${PG_ICONS.search}
+            <input id="wkHomeSearch" type="search" autocomplete="off" spellcheck="false"
+                   placeholder="What are you looking for?" />
+          </label>
+          ${can ? `<div class="wk-home-actions">
+            ${pgCan('add') ? `<button type="button" class="wk-act wk-act-primary" id="wkHomeNew">${PG_ICONS.plus}<span>New page</span></button>` : ''}
+            ${pgCan('upload') ? `<button type="button" class="wk-act" id="wkHomeUpload">${PG_ICONS.upload}<span>Upload</span></button>` : ''}
+            ${pgCan('link') ? `<button type="button" class="wk-act" id="wkHomeLink">${PG_ICONS.link}<span>Link a Google file</span></button>` : ''}
+          </div>` : ''}
+        </section>
+        <div class="wk-home-grid">
+          <section class="wk-home-card">
+            <h3>Recently updated</h3>
+            ${recent.length ? recent.map(p => `
+              <a href="#" class="wk-recent" data-path="${esc(p.path)}">
+                ${pgKindBadge(p)}
+                <span class="wk-recent-title">${esc(p.title)}</span>
+                <span class="wk-recent-when">${esc(pgAgo(p.modified))}</span>
+              </a>`).join('')
+              : `<div class="wk-home-empty">Nothing here yet — ${can ? 'create a page, upload a file or link a Google file to get started.' : 'pages will show up here once the team adds them.'}</div>`}
+          </section>
+          <section class="wk-home-card">
+            <h3>At a glance</h3>
+            <div class="wk-stats">
+              ${stats.map(st => `<div class="wk-stat"><span class="wk-kind wk-kind-${st.cls}">${PG_ICONS[st.icon]}</span>
+                <div><b>${st.n}</b><span>${st.label}</span></div></div>`).join('')}
+            </div>
+            <div class="wk-home-empty">${pgPages.length} page${pgPages.length === 1 ? '' : 's'} in ${folders} folder${folders === 1 ? '' : 's'}</div>
+          </section>
+        </div>
+        <div class="wk-home-tip">${PG_ICONS.eye}<div><strong>Tip:</strong> ${tip}</div></div>
+      </div>`;
+
+    contentEl.querySelectorAll('.wk-recent').forEach(a => a.addEventListener('click', (e) => {
+      e.preventDefault();
+      const p = pgPages.find(x => x.path === a.dataset.path);
+      if (p) pgOpenPage(p);
+    }));
+    const bind = (id, fn) => { const b = document.getElementById(id); if (b) b.addEventListener('click', fn); };
+    bind('wkHomeNew', () => pgCreateNewPage());
+    bind('wkHomeUpload', () => { const input = document.getElementById('wgtFileInput'); if (input) input.click(); });
+    bind('wkHomeLink', () => pgLinkDoc());
+
+    // Typing here searches in the header box, which keeps the focus once the
+    // results replace this page.
+    const homeSearch = document.getElementById('wkHomeSearch');
+    const header = document.getElementById('wgtSearch');
+    if (homeSearch && header) homeSearch.addEventListener('input', () => {
+      header.value = homeSearch.value;
+      header.focus();
+      header.setSelectionRange(header.value.length, header.value.length);
+      header.dispatchEvent(new Event('input'));
+    });
+
+    // A new phrase every few seconds, until the reader leaves home.
+    clearInterval(pgPhraseTimer);
+    let i = start;
+    pgPhraseTimer = setInterval(() => {
+      const el = document.getElementById('wkPhrase');
+      if (!el || !pgShowingHome) { clearInterval(pgPhraseTimer); return; }
+      el.classList.add('wk-fade');
+      setTimeout(() => {
+        i = (i + 1) % PG_PHRASES.length;
+        el.textContent = PG_PHRASES[i];
+        el.classList.remove('wk-fade');
+      }, 350);
+    }, 5000);
+
+    pgRenderSidebar(pgSearchValue());
+  }
+
+  function pgShowCreatePrompt() {
+    const contentEl = document.getElementById('wgtContent');
+    if (!contentEl) return;
+    contentEl.classList.remove('wgt-content-doc');
+    const can = pgCanEdit();
+    contentEl.innerHTML = `
+      <div class="wgt-welcome">
+        <h3>${esc(pgFolder ? pgFolderLabel(pgFolder) : PG_SPACE)} is empty</h3>
+        <p>${can
+            ? 'Upload a document or create a page — it will be saved into <code>' +
+              esc(pgFolder ? PG_SPACE + '/' + pgFolder : PG_SPACE) + '</code> in Google Drive.'
+            : pgReadOnlyReason() === 'viewer'
+              ? 'You have read-only access to this wiki.'
+              : 'Sign in with your ' + esc(PG_ACCOUNT) + ' to add pages.'}</p>
+        ${can ? `
+          <div class="wgt-welcome-actions">
+            ${pgCan('upload') ? '<button class="wgt-btn wgt-primary" id="wgtFirstUploadBtn">⭱ Upload document</button>' : ''}
+            ${pgCan('add') ? '<button class="wgt-btn" id="wgtFirstPageBtn">+ New page</button>' : ''}
+            ${pgCan('link') ? '<button class="wgt-btn" id="wgtFirstLinkBtn">🔗 Link Google file</button>' : ''}
+            ${pgCan('add') ? '<button class="wgt-btn" id="wgtFirstFolderBtn">📁 New folder</button>' : ''}
+          </div>
+          <p class="wgt-welcome-hint">New pages and uploads (Word, PDF, text, Markdown, HTML) become
+          Google Docs, Excel and CSV become Google Sheets, and PowerPoint becomes Google Slides.
+          Added files to the Drive folder directly?
+          <a href="#" id="wgtScanLink">Reload the page list</a> to pick them up.</p>` : ''}
+      </div>`;
+    const btn = document.getElementById('wgtFirstPageBtn');
+    if (btn) btn.addEventListener('click', () => pgCreateNewPage());
+    const up = document.getElementById('wgtFirstUploadBtn');
+    if (up) up.addEventListener('click', () => {
+      const input = document.getElementById('wgtFileInput');
+      if (input) input.click();
+    });
+    const link = document.getElementById('wgtFirstLinkBtn');
+    if (link) link.addEventListener('click', () => pgLinkDoc());
+    const mkdir = document.getElementById('wgtFirstFolderBtn');
+    if (mkdir) mkdir.addEventListener('click', () => pgCreateFolder());
+    const scan = document.getElementById('wgtScanLink');
+    if (scan) scan.addEventListener('click', (e) => { e.preventDefault(); pgLoadPages({ fresh: true }); });
+  }
+
+  // ── Sidebar ──────────────────────────────────────────────
+  function pgRenderSidebar(filter) {
+    const sidebarEl = document.getElementById('wgtSidebar');
+    if (!sidebarEl) return;
+    const q = pgSearchKey(filter);
+    const searching = !!q;
+
+    // Only bail out before the folder list has anything to show. Folders exist
+    // independently of pages — an empty folder still needs to be selectable.
+    if (!pgLoaded) {
+      sidebarEl.innerHTML = `<div class="wgt-empty-hint">Loading pages…</div>`;
+      return;
+    }
+    if (!pgPages.length && pgFolders().length <= 1) {
+      sidebarEl.innerHTML = `
+        <div class="wgt-folder-head">${esc(PG_ROOT_FOLDER)}</div>
+        <div class="wgt-empty-hint">No pages yet.</div>`;
+      return;
+    }
+
+    // Searching looks across every folder — a page you can't remember the
+    // folder for is exactly when search matters. Browsing stays inside the
+    // folder you picked. Titles match instantly; body text matches arrive
+    // from the server (pgRunSearch) and fill in the rest.
+    const matches = searching
+      ? pgPages.filter(p => pgMatchesSearch(p, q))
+      : pgPages.filter(p => (p.folder || '') === pgFolder);
+
+    let html = '';
+    const folders = pgFolders();
+    if (searching) {
+      html += `<div class="wgt-folder-head">${matches.length} result${matches.length === 1 ? '' : 's'} in all folders</div>`;
+    } else {
+      if (folders.length > 1) {
+        // Accordion: closed, it is one row showing where you are. Open, it is
+        // the full list. That keeps the sidebar the same height whether there
+        // are three folders or thirty, leaving room for the pages below.
+        html += `<button type="button" class="wgt-folder-head wgt-folder-section" id="wgtFoldersToggle"
+                   aria-expanded="${!pgFoldersCollapsed}"
+                   title="${pgFoldersCollapsed ? 'Choose a folder' : 'Hide the folder list'}">
+            <span class="wgt-chev">${pgFoldersCollapsed ? '▸' : '▾'}</span>
+            <span class="wgt-folder-current">${esc(pgFolderLabel(pgFolder))}</span>
+            <span class="wgt-space-count">${folders.length - 1}</span>
+          </button>`;
+
+        // A filter appears once the list is long enough to scroll.
+        const manyFolders = folders.length > 9;
+        const ff = (pgFolderFilter || '').trim().toLowerCase();
+
+        html += `<div class="wgt-folder-list"${pgFoldersCollapsed ? ' hidden' : ''}>`;
+        if (!pgFoldersCollapsed && manyFolders) {
+          html += `<input type="text" class="wgt-folder-filter" id="wgtFolderFilter"
+                     placeholder="Filter folders…" value="${esc(pgFolderFilter || '')}" />`;
+        }
+        let shown = 0;
+        folders.forEach(f => {
+          if (pgFolderHidden(f)) return;          // an ancestor is collapsed
+          // While filtering, match anywhere in the path and ignore the tree.
+          if (ff && !(f || PG_ROOT_FOLDER).toLowerCase().includes(ff)) return;
+          shown++;
+          const count = pgPages.filter(p => (p.folder || '') === f).length;
+          const depth = f ? f.split('/').length - 1 : 0;
+          const hasKids = pgFolderHasChildren(f, folders);
+          const twisty = hasKids
+            ? `<button type="button" class="wgt-folder-twisty" data-folder-toggle="${esc(f)}"
+                 title="${pgCollapsed[f] ? 'Expand' : 'Collapse'}">${pgCollapsed[f] ? '▸' : '▾'}</button>`
+            : `<span class="wgt-folder-twisty wgt-folder-twisty-blank"></span>`;
+          // The top level isn't a real folder on disk, so it can't be renamed
+          // or deleted — only the subfolders get those controls.
+          const tools = (f && (pgCan('edit') || pgCan('delete')))
+            ? `<span class="wgt-folder-tools">
+                 ${pgCan('edit') ? `<button type="button" class="wgt-folder-tool" data-folder-edit="${esc(f)}" title="Rename folder">✎</button>` : ''}
+                 ${pgCan('delete') ? `<button type="button" class="wgt-folder-tool wgt-folder-tool-danger" data-folder-del="${esc(f)}" title="Delete folder">🗑</button>` : ''}
+               </span>` : '';
+          html += `<div class="wgt-folder-row${f === pgFolder ? ' active' : ''}" style="padding-left:${depth * 12}px">
+              ${twisty}
+              <button type="button" class="wgt-folder-item" data-folder="${esc(f)}">
+                <span class="wgt-folder-name">${esc(pgFolderLabel(f))}</span>
+                <span class="wgt-space-count">${count}</span>
+              </button>${tools}
+            </div>`;
+        });
+        if (!pgFoldersCollapsed && ff && !shown) {
+          html += `<div class="wgt-empty-hint">No folders match "${esc(pgFolderFilter)}".</div>`;
+        }
+        html += `</div>`;
+      }
+      html += `<button type="button" class="wgt-space-title${pgShowingToc ? ' active' : ''}" data-space="${esc(pgFolder)}" title="Show a contents list for this folder">${esc(pgFolderLabel(pgFolder))}<span class="wgt-space-count">${matches.length}</span></button>`;
+    }
+
+    html += `<div class="wgt-page-list" data-space-list="${esc(pgFolder)}">`;
+    matches.forEach(p => {
+      const where = searching && (p.folder || '') !== ''
+        ? `<span class="wgt-page-folder">${esc(pgFolderLabel(p.folder))}</span>` : '';
+      html += `<a href="#" draggable="false" class="wgt-page-link${pgCurrent === p ? ' active' : ''}" data-path="${esc(p.path)}" title="${esc(p.title)} — drag onto a folder to move it"><span class="wgt-drag-dots" aria-hidden="true"></span>${pgSideIcon(p)}<span class="wgt-page-link-text">${esc(p.title)}${p.broken ? ' <span title="The wiki can no longer open this linked file">⚠</span>' : ''}${where}</span></a>`;
+    });
+    html += `</div>`;
+
+    if (!matches.length) {
+      html += `<div class="wgt-empty-hint">${searching
+        ? 'No pages match "' + esc(filter) + '".'
+        : 'This folder is empty.'}</div>`;
+    }
+
+    sidebarEl.innerHTML = html;
+    sidebarEl.querySelectorAll('[data-path]').forEach(a => {
+      a.addEventListener('click', (e) => {
+        e.preventDefault();
+        const p = pgPages.find(x => x.path === a.dataset.path);
+        if (p) pgOpenPage(p);
+      });
+    });
+    sidebarEl.querySelectorAll('[data-folder]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        pgFolder = btn.dataset.folder;
+        // Picking a folder closes the accordion — the list has done its job,
+        // and the pages get the room back.
+        pgFoldersCollapsed = true;
+        pgFolderFilter = '';
+        pgSaveFolderUi();
+        pgRenderSidebar('');
+        const first = pgPages.find(p => (p.folder || '') === pgFolder);
+        if (first) pgOpenPage(first); else pgShowCreatePrompt();
+      });
+    });
+    const folderFilter = document.getElementById('wgtFolderFilter');
+    if (folderFilter) {
+      folderFilter.addEventListener('input', () => {
+        pgFolderFilter = folderFilter.value;
+        pgRenderSidebar(filter);
+        const again = document.getElementById('wgtFolderFilter');
+        if (again) { again.focus(); again.setSelectionRange(again.value.length, again.value.length); }
+      });
+      folderFilter.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') { pgFolderFilter = ''; pgRenderSidebar(filter); }
+      });
+    }
+    const sectionToggle = document.getElementById('wgtFoldersToggle');
+    if (sectionToggle) sectionToggle.addEventListener('click', () => {
+      pgFoldersCollapsed = !pgFoldersCollapsed;
+      pgSaveFolderUi();
+      pgRenderSidebar(filter);
+    });
+    sidebarEl.querySelectorAll('[data-folder-toggle]').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();                      // don't also switch folder
+        const f = btn.dataset.folderToggle;
+        if (pgCollapsed[f]) delete pgCollapsed[f]; else pgCollapsed[f] = true;
+        pgSaveFolderUi();
+        pgRenderSidebar(filter);
+      });
+    });
+    sidebarEl.querySelectorAll('[data-folder-edit]').forEach(btn => {
+      btn.addEventListener('click', (e) => { e.stopPropagation(); pgRenameFolder(btn.dataset.folderEdit); });
+    });
+    sidebarEl.querySelectorAll('[data-folder-del]').forEach(btn => {
+      btn.addEventListener('click', (e) => { e.stopPropagation(); pgDeleteFolder(btn.dataset.folderDel); });
+    });
+    sidebarEl.querySelectorAll('[data-space]').forEach(btn => {
+      btn.addEventListener('click', () => pgRenderTableOfContents(btn.dataset.space));
+    });
+    pgInitSidebarSortable(sidebarEl, !!q || !pgCan('edit'));
+  }
+
+  // Drag-to-reorder the page list. Disabled while a search filter is active,
+  // since the visible list is then a subset and dropping into it would imply
+  // an order for pages that aren't on screen.
+  function pgInitSidebarSortable(sidebarEl, filtering) {
+    if (typeof Sortable === 'undefined') return;
+
+    sidebarEl.querySelectorAll('[data-space-list]').forEach(list => {
+      if (list._pgSortable) { list._pgSortable.destroy(); list._pgSortable = null; }
+      if (filtering) { list.classList.add('wgt-no-drag'); return; }
+      list._pgSortable = new Sortable(list, {
+        // Shared group so a page can also be dropped onto a folder row below.
+        group: { name: 'wiki-pages', pull: true, put: true },
+        animation: 180,
+        delay: 120,
+        delayOnTouchOnly: true,
+        ghostClass: 'wgt-drag-ghost',
+        chosenClass: 'wgt-drag-chosen',
+        dragClass: 'wgt-drag-active',
+        onStart: () => sidebarEl.classList.add('wgt-dragging'),
+        onEnd: (evt) => {
+          sidebarEl.classList.remove('wgt-dragging');
+          if (evt.to !== evt.from) return;        // handled by the folder's onAdd
+          if (evt.oldIndex === evt.newIndex) return;
+          // Rebuild the saved order from the DOM across every space list, so
+          // the stored order always mirrors exactly what's on screen.
+          const paths = [];
+          sidebarEl.querySelectorAll('[data-space-list] .wgt-page-link').forEach(a => paths.push(a.dataset.path));
+          pgSaveOrder(paths);
+          pgSortPages();
+          pgToast('Order saved');
+        }
+      });
+    });
+
+    // Each folder row is its own drop target: dragging a page onto one moves
+    // the file into that folder. `sort: false` and `pull: false` mean nothing
+    // can be dragged back out of a row — it only ever receives.
+    if (filtering || !pgCan('edit')) return;
+    sidebarEl.querySelectorAll('.wgt-folder-row').forEach(row => {
+      if (row._pgSortable) { row._pgSortable.destroy(); row._pgSortable = null; }
+      const target = row.querySelector('[data-folder]');
+      if (!target) return;
+      row._pgSortable = new Sortable(row, {
+        group: { name: 'wiki-pages', pull: false, put: true },
+        sort: false,
+        animation: 0,
+        onAdd: (evt) => {
+          const el = evt.item;
+          const path = el && el.dataset ? el.dataset.path : null;
+          el.remove();                              // the re-render rebuilds the list
+          sidebarEl.classList.remove('wgt-dragging');
+          if (path) pgMovePageToFolder(path, target.dataset.folder);
+        }
+      });
+    });
+  }
+
+  // Moves a page (and its annotations) into another Drive folder.
+  async function pgMovePageToFolder(pagePath, targetFolder) {
+    const p = pgPages.find(x => x.path === pagePath);
+    if (!p) return;
+    const dest = targetFolder || '';
+    if ((p.folder || '') === dest) return;
+    if (!pgCan('edit')) return pgRequire('edit');
+    try {
+      pgToast('Moving…', 20000);
+      const info = await pgCall('movePage', p.id, dest);
+      // Same Drive file, new folder — the content already loaded still holds.
+      Object.assign(p, { path: info.path, file: info.file, folder: info.folder, modified: info.modified });
+      pgFolder = dest;
+      pgSortPages();
+      pgOpenPage(p);
+      pgToast('Moved to ' + pgFolderLabel(dest));
+    } catch (err) {
+      console.error(err);
+      pgToast("Couldn't move the page: " + pgErrMsg(err), 7000);
+      pgRenderSidebar(pgSearchValue());   // put the dragged row back
+    }
+  }
+
+  // ── Table of contents (click the space name in the sidebar) ──
+  function pgRenderTableOfContents(space) {
+    const contentEl = document.getElementById('wgtContent');
+    if (!contentEl) return;
+    contentEl.classList.remove('wgt-content-doc');
+    // `space` is the folder path here ('' = top level). Follows pgPages, which
+    // is already in the user's manual drag order.
+    const folder = space || '';
+    const pages = pgPages.filter(p => (p.folder || '') === folder);
+    pgExitDocMax();
+    pgShowingToc = true;
+    pgShowingHome = false;
+    pgCurrent = null;
+    pgEditing = false;
+    pgHideCommentsPanel();
+
+    let html = `<div class="wgt-toc-header">
+        <h2>${esc(pgFolderLabel(folder))}</h2>
+        <div class="wgt-toc-count">${pages.length} page${pages.length === 1 ? '' : 's'}</div>
+      </div>`;
+    if (!pages.length) {
+      html += `<div class="wgt-empty-hint">No pages yet. Click "+ New page" or upload a document.</div>`;
+    } else {
+      html += `<div class="wgt-toc-list">`;
+      pages.forEach((p, i) => {
+        const snippet = pgTruncate(p.snippet || '', 130);
+        html += `<a href="#" class="wgt-toc-item" data-path="${esc(p.path)}">
+            <span class="wgt-toc-num">${i + 1}.</span>
+            ${pgKindBadge(p)}
+            <span class="wgt-toc-body">
+              <span class="wgt-toc-title">${esc(p.title)}</span>
+              ${snippet ? `<div class="wgt-toc-snippet">${esc(snippet)}</div>` : ''}
+            </span>
+            <span class="wgt-toc-type">${esc(pgKindOf(p).label)}</span>
+          </a>`;
+      });
+      html += `</div>`;
+    }
+    contentEl.innerHTML = html;
+    contentEl.querySelectorAll('.wgt-toc-item').forEach(a => {
+      a.addEventListener('click', (e) => {
+        e.preventDefault();
+        const p = pgPages.find(x => x.path === a.dataset.path);
+        if (p) pgOpenPage(p);
+      });
+    });
+    pgRenderSidebar(pgSearchValue());
+  }
+
+  // ── Search ───────────────────────────────────────────────
+  // Titles are matched here as you type. Page text lives in Drive, so the
+  // server searches it (searchPages) and the hits merge in when they arrive.
+  // hits: page id -> snippet; unreadable: pages the server couldn't look inside.
+  let pgSearch = { q: '', pending: false, hits: {}, unreadable: [], searched: 0 };
+  let pgSearchTimer = null;
+  let pgSearchSeq = 0;
+
+  function pgMatchesSearch(p, q) {
+    if (pgTextMatches(pgSearchKey(p.title), q)) return true;
+    if (pgSearch.q === q && pgSearch.hits[p.id] !== undefined) return true;
+    // Pages already opened can be checked on the spot.
+    return !!p.content && pgTextMatches(pgPlainText(p.content).toLowerCase(), q);
+  }
+
+  // The same three levels as matchScore_ in Api.gs: exact phrase, the same
+  // words in order whatever the punctuation between them, or every word
+  // somewhere in the text.
+  function pgLoose(str) {
+    return String(str).toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+  }
+  function pgTextMatches(lower, q) {
+    if (!lower) return false;
+    if (lower.includes(q)) return true;
+    const ql = pgLoose(q);
+    if (!ql) return false;
+    const loose = pgLoose(lower);
+    return loose.includes(ql) || ql.split(' ').every(w => loose.includes(w));
+  }
+
+  function pgRunSearch(query) {
+    const q = pgSearchKey(query);
+    clearTimeout(pgSearchTimer);
+    if (!q) { pgSearch = { q: '', pending: false, hits: {}, unreadable: [], searched: 0 }; return; }
+    if (pgSearch.q !== q) pgSearch = { q, pending: true, hits: {}, unreadable: [], searched: 0 };
+    const seq = ++pgSearchSeq;
+    // Wait for a pause in typing — each search is a trip to Drive.
+    pgSearchTimer = setTimeout(async () => {
+      try {
+        const res = await pgCall('searchPages', q);
+        if (seq !== pgSearchSeq) return;            // a newer search has started
+        const hits = Array.isArray(res) ? res : (res && res.hits) || [];
+        const map = {};
+        hits.forEach(h => { map[h.id] = h.snippet || ''; });
+        pgSearch = { q, pending: false, hits: map,
+                     unreadable: (res && res.unreadable) || [], searched: (res && res.searched) || 0 };
+        // A hit on a page this tab hasn't seen means someone added it since
+        // the list loaded — fetch the list so the result can be shown.
+        if ((hits || []).some(h => !pgPages.some(p => p.id === h.id))) {
+          await pgLoadPages({ fresh: true, quiet: true });
+          if (seq !== pgSearchSeq) return;
+        }
+      } catch (err) {
+        if (seq !== pgSearchSeq) return;
+        console.error(err);
+        pgSearch = { q, pending: false, hits: {}, unreadable: [], searched: 0, failed: pgErrMsg(err) };
+        pgToast('Searching page text failed: ' + pgErrMsg(err) + ' — showing title matches only', 6000);
+      }
+      const current = pgSearchValue();
+      if (pgSearchKey(current) !== q) return;
+      pgRenderSidebar(current);
+      pgRenderSearchResults(current);
+    }, 350);
+  }
+
+  function pgHighlightSnippet(text, query) {
+    const clean = (text || '').replace(/\s+/g, ' ').trim();
+    const idx = clean.toLowerCase().indexOf(query.toLowerCase());
+    let snippet;
+    if (idx === -1) {
+      snippet = pgTruncate(clean, 140);
+    } else {
+      const start = Math.max(0, idx - 50);
+      const end = Math.min(clean.length, idx + query.length + 50);
+      snippet = (start > 0 ? '…' : '') + clean.slice(start, end) + (end < clean.length ? '…' : '');
+    }
+    const escSnippet = esc(snippet);
+    const terms = [query].concat(pgLoose(query).split(' ')).filter(t => t && t.length > 1)
+      .sort((a, b) => b.length - a.length)
+      .map(t => esc(t).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    if (!terms.length) return escSnippet;
+    const re = new RegExp('(' + terms.join('|') + ')', 'ig');
+    return escSnippet.replace(re, '<mark class="wgt-search-mark">$1</mark>');
+  }
+
+  function pgRenderSearchResults(query) {
+    const contentEl = document.getElementById('wgtContent');
+    if (!contentEl) return;
+    contentEl.classList.remove('wgt-content-doc');
+    const q = (query || '').trim();
+    if (!q) {
+      // Search cleared — restore whatever was being viewed before.
+      if (pgShowingToc) pgRenderTableOfContents(pgFolder);
+      else if (pgCurrent) pgRenderPageView();
+      else pgShowHome();
+      return;
+    }
+    pgExitDocMax();
+    const ql = pgSearchKey(q);
+    const pending = pgSearch.q === ql && pgSearch.pending;
+    const matches = pgPages.filter(p => pgMatchesSearch(p, ql));
+    const done = pgSearch.q === ql && !pending;
+    const unreadable = done ? (pgSearch.unreadable || []) : [];
+    const notice = unreadable.length
+      ? `<div class="wk-search-notice">${PG_ICONS.eye}<div><strong>Couldn't look inside ${unreadable.length}
+           page${unreadable.length === 1 ? '' : 's'}</strong> — ${unreadable.map(u =>
+             `<span class="wk-search-notice-item">${esc(u.title)} <em>(${esc(u.reason)})</em></span>`).join(', ')}</div></div>`
+      : (done && pgSearch.failed
+          ? `<div class="wk-search-notice">${PG_ICONS.eye}<div><strong>Page text couldn't be searched</strong> — ${esc(pgSearch.failed)}. Only titles were checked.</div></div>`
+          : '');
+    if (!matches.length) {
+      contentEl.innerHTML = `<div class="wgt-welcome"><h3>${pending ? 'Searching…' : 'No matches'}</h3>
+        <p>${pending ? 'Looking through every page for' : 'No pages match'} "${esc(q)}"${
+          done && pgSearch.searched ? ` — searched ${pgSearch.searched} page${pgSearch.searched === 1 ? '' : 's'}` : ''}.</p>${notice}</div>`;
+      return;
+    }
+    let html = `<div class="wgt-search-results">
+      <div class="wgt-search-results-header">${matches.length} page${matches.length === 1 ? '' : 's'} match "${esc(q)}"${
+        pending ? ' — still searching page text…' : ''}</div>${notice}`;
+    matches.forEach(p => {
+      const serverSnippet = pgSearch.q === ql ? pgSearch.hits[p.id] : undefined;
+      const bodyForSnippet = serverSnippet !== undefined ? serverSnippet
+        : (p.content !== null ? pgPlainText(p.content) : p.snippet);
+      html += `<a href="#" class="wgt-search-result" data-path="${esc(p.path)}">
+        <div class="wgt-search-result-title">${pgSideIcon(p)}<span>${pgHighlightSnippet(p.title, q)}</span>${
+          (p.folder || '') ? ` <span class="wgt-page-folder">in ${esc(pgFolderLabel(p.folder))}</span>` : ''}</div>
+        <div class="wgt-search-result-snippet">${pgHighlightSnippet(bodyForSnippet, q)}</div>
+      </a>`;
+    });
+    html += `</div>`;
+    contentEl.innerHTML = html;
+    contentEl.querySelectorAll('.wgt-search-result').forEach(a => {
+      a.addEventListener('click', (e) => {
+        e.preventDefault();
+        const p = pgPages.find(x => x.path === a.dataset.path);
+        if (!p) return;
+        const search = document.getElementById('wgtSearch');
+        if (search) search.value = '';
+        pgRunSearch('');
+        pgRenderSidebar('');
+        pgOpenPage(p);
+      });
+    });
+  }
+
+  // ── View / edit ──────────────────────────────────────────
+  function pgOpenPage(page) {
+    if (page !== pgCurrent) pgExitDocMax();
+    pgShowingHome = false;
+    pgCurrent = page;
+    pgEditing = false;
+    pgDocInline = false;
+    pgShowingToc = false;
+    pgFindClose();          // a find is scoped to one page
+    pgRenderSidebar(pgSearchValue());
+    if (page.content === null || !page.annotations) {
+      pgShowPageLoading(page);
+      pgEnsureContent(page).then(() => {
+        if (pgCurrent === page && !pgEditing) pgShowOpenedPage();
+      }, (err) => {
+        console.error(err);
+        if (pgCurrent !== page) return;
+        const contentEl = document.getElementById('wgtContent');
+        if (contentEl) contentEl.innerHTML = `
+          <div class="wgt-welcome">
+            <h3>Couldn't open "${esc(page.title)}"</h3>
+            <p class="wgt-upload-fail">${esc(pgErrMsg(err))}</p>
+            <button class="wgt-btn wgt-primary" id="wgtRetryOpen">Try again</button>
+          </div>`;
+        const retry = document.getElementById('wgtRetryOpen');
+        if (retry) retry.addEventListener('click', () => pgOpenPage(page));
+      });
+      return;
+    }
+    pgShowOpenedPage();
+  }
+  function pgShowOpenedPage() {
+    pgRenderPageView();
+    const panel = document.getElementById('wgtCommentsPanel');
+    if (panel && panel.classList.contains('wgt-open')) pgRenderCommentsPanel();
+  }
+  function pgShowPageLoading(page) {
+    const contentEl = document.getElementById('wgtContent');
+    if (!contentEl) return;
+    contentEl.innerHTML = `
+      <div class="wgt-page-header">${pgPageTitleHtml(page)}</div>
+      <div class="wgt-empty-hint">Loading…</div>`;
+    pgUpdateCommentBadge();
+  }
+
+  // Readable plain text for search snippets and the table of contents — drops
+  // the leading title and any HTML tags, so Word pages don't show markup.
+  function pgPlainText(content) {
+    return pgMarkupToText(String(content || '')
+      .replace(/^\s*#\s+.*\n+/, '')
+      .replace(/<h1[^>]*>[\s\S]*?<\/h1>/i, ''));
+  }
+  // Same rules as markupToText_ in Api.gs, so a page matches the same way
+  // whether the browser or the server checks it: formatting tags vanish
+  // (a <span> mid-word mustn't split it), block tags become spaces.
+  const PG_INLINE_TAGS = /<\/?(span|a|b|i|u|em|strong|sup|sub|font|s|strike|del|ins|mark|code|small|big|abbr|cite|q)\b[^>]*>/gi;
+  function pgMarkupToText(html) {
+    const text = html
+      .replace(/<(script|style)[^>]*>[\s\S]*?<\/\1>/gi, ' ')
+      .replace(PG_INLINE_TAGS, '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&amp;/g, '&')
+      .replace(/(\*\*|__|~~|`)/g, '');
+    return pgNormalizeText(text).replace(/\s+/g, ' ').trim();
+  }
+  // Curly quotes, long dashes and non-breaking spaces as the plain characters
+  // people type — one for one, like normalizeText_ in Api.gs.
+  function pgNormalizeText(str) {
+    return String(str)
+      .replace(/[\u2018\u2019\u201A\u201B\u2032]/g, '\u0027')
+      .replace(/[\u201C\u201D\u201E\u201F\u2033]/g, '\u0022')
+      .replace(/[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]/g, '-')
+      .replace(/[\u00A0\u2007\u202F]/g, ' ');
+  }
+  // A search query as it is compared: normalised, single-spaced, lowercase.
+  function pgSearchKey(query) {
+    return pgNormalizeText(query || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  }
+
+  // New pages are .html. Older .md pages still work, so both formats have to be
+  // handled — the extension decides, with a content sniff as a backstop.
+  const PG_EXT = '.html';
+  function pgIsHtmlFile(name) { return /\.html?$/i.test(name || ''); }
+  function pgLooksLikeHtml(content) {
+    const t = String(content || '').trimStart();
+    return t.startsWith('<') && !/^\s*#\s+/m.test(t.slice(0, 400));
+  }
+  function pgPageIsHtml(page) {
+    if (!page) return false;
+    if (pgIsDocPage(page)) return true;
+    return pgIsHtmlFile(page.path) || pgLooksLikeHtml(page.content);
+  }
+  // True for pages imported by docx-preview, which ship their own stylesheet.
+  // The hub's page typography stands aside for these — see 06-wiki.css.
+  // Google Doc exports (class="gdoc") carry their own stylesheet the same way.
+  function pgIsNativeDoc(content) { return /class=\x22[wg]doc\x22/.test(String(content || '')); }
+
+  // Turns page content into display HTML, whichever format it is stored in.
+  //
+  // The <style> blocks are lifted out before sanitising and put back after.
+  // DOMPurify empties the *contents* of a style element even when the tag
+  // itself is allowed — and for an imported Word document that stylesheet is
+  // the entire design: font sizes, colours, typefaces, table borders and
+  // shading. Losing it is why imports came through looking plain.
+  //
+  // The CSS is machine-generated by docx-preview and scoped under .wdoc, so it
+  // can't restyle the hub. It is still swept for anything script-like first.
+  function pgContentToHtml(content, isHtml) {
+    const withLinks = pgResolveWikiLinks(content);
+    const treatAsHtml = isHtml === undefined ? pgLooksLikeHtml(content) : isHtml;
+    let raw = treatAsHtml
+      ? withLinks
+      : (window.marked ? marked.parse(withLinks) : withLinks);
+
+    const sheets = [];
+    raw = raw.replace(/<style[^>]*>([\s\S]*?)<\/style>/gi, (m, css) => { sheets.push(css); return ''; });
+
+    // A frame with no real source resolves to index.html, which Chrome blocks
+    // on file:// ("unique security origins"). Real embeds always have an https
+    // source, so anything else goes.
+    raw = raw.replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe>|<iframe\b[^>]*\/?>/gi,
+      (tag) => /src\s*=\s*[\x22\x27]https:\/{2}/i.test(tag) ? tag : '');
+
+    let safe = window.DOMPurify ? DOMPurify.sanitize(raw, PG_SANITIZE) : raw;
+
+    if (sheets.length) {
+      const css = sheets.join('\n')
+        .replace(/<\/?[a-z][^>]*>/gi, '')        // no markup inside a stylesheet
+        .replace(/javascript\s*:/gi, '')
+        .replace(/expression\s*\(/gi, '')
+        .replace(/@import[^;]*;/gi, '');         // no pulling in remote CSS
+      safe = '<style>' + css + '</style>' + safe;
+    }
+    return safe;
+  }
+
+  function pgResolveWikiLinks(md) {
+    return md.replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (m, target, label) => {
+      const clean = target.trim();
+      const text = (label || clean).trim();
+      const exists = pgPages.some(p => p.title.toLowerCase() === clean.toLowerCase());
+      const cls = exists ? 'wgt-wikilink' : 'wgt-wikilink wgt-missing';
+      return `<a href="#" class="${cls}" data-wikilink="${encodeURIComponent(clean)}">${esc(text)}</a>`;
+    });
+  }
+
+  function pgRenderPageView() {
+    const p = pgCurrent;
+    const contentEl = document.getElementById('wgtContent');
+    if (!p || !contentEl) return;
+    contentEl.classList.remove('wgt-content-doc');
+    if (pgIsDocPage(p)) return pgRenderDocView(p, contentEl);
+    const safeHtml = pgContentToHtml(p.content, pgPageIsHtml(p));
+
+    contentEl.innerHTML = `
+      <div class="wgt-page-header">
+        ${pgPageTitleHtml(p)}
+        <div class="wgt-page-actions">
+          ${pgIconBtn('wgtFindBtn', 'search', 'Find in this page (Ctrl+F)')}
+          ${pgIconBtn('wgtDeleteBtn', 'trash', 'Delete page', 'wk-pa-danger')}
+          <span class="wk-pa-sep"></span>
+          ${pgCommentsBtnHtml()}
+          ${pgPrimaryBtn('wgtEditBtn', 'pen', 'Edit')}
+        </div>
+      </div>
+      <div class="wgt-doc-canvas">
+        <div class="wgt-doc-page">
+          <div class="wgt-view${pgIsNativeDoc(p.content) ? ' wgt-doc-native' : ''}" id="wgtView">${safeHtml}</div>
+        </div>
+      </div>
+    `;
+    const editBtn = document.getElementById('wgtEditBtn');
+    const delBtn = document.getElementById('wgtDeleteBtn');
+    const findBtn = document.getElementById('wgtFindBtn');
+    if (editBtn) editBtn.addEventListener('click', pgRenderPageEditor);
+    pgBindCommentsBtn();
+    if (delBtn) delBtn.addEventListener('click', () => pgDeletePage(p));
+    if (findBtn) findBtn.addEventListener('click', () => pgFindOpen());
+    pgFindReset();
+
+    pgApplyAnnotations(p);
+    pgUpdateCommentBadge();
+    pgApplyPermissions();
+  }
+
+  function pgRenderDocView(p, contentEl) {
+    const editing = pgDocInline && pgCan('edit');
+    contentEl.classList.add('wgt-content-doc');
+    contentEl.innerHTML = `
+      <div class="wgt-page-header">
+        ${pgPageTitleHtml(p)}
+        <div class="wgt-page-actions">
+          ${editing
+            ? `<span class="wk-autosave"><span class="wk-autosave-dot"></span>Saved automatically</span>
+               ${pgMaxButtonsHtml()}
+               ${pgIconBtn('wgtNewTabDocBtn', 'external', 'Open this Doc in its own tab')}
+               <span class="wk-pa-sep"></span>
+               ${pgCommentsBtnHtml()}
+               ${pgPrimaryBtn('wgtDoneDocBtn', 'check', 'Done', 'Done editing — back to the view')}`
+            : `${pgMaxButtonsHtml()}
+               ${pgIconBtn('wgtOpenDocBtn', 'external', 'Open in ' + pgAppInfo(p).name)}
+               ${p.kind === 'link'
+                 ? pgIconBtn('wgtDeleteBtn', 'unlink', 'Remove link (the ' + pgNoun(p) + ' itself is kept)', 'wk-pa-danger')
+                 : pgIconBtn('wgtDeleteBtn', 'trash', 'Delete page', 'wk-pa-danger')}
+               <span class="wk-pa-sep"></span>
+               ${pgCommentsBtnHtml()}
+               ${pgCan('edit') ? pgPrimaryBtn('wgtEditDocBtn', 'pen', 'Edit', 'Edit here, in the ' + pgAppInfo(p).name + ' editor') : ''}`}
+        </div>
+      </div>
+      <div class="wgt-gdoc-wrap${editing ? ' wgt-gdoc-editing' : ''}">
+        <iframe class="wgt-gdoc-frame" id="wgtDocFrame" src="${esc(editing ? pgDocEditUrl(p) : pgDocPreviewUrl(p))}"
+                title="${esc(p.title)}" allow="clipboard-read; clipboard-write" loading="eager"></iframe>
+        <div class="wgt-gdoc-hint">${editing
+          ? 'Editor not loading, or says you can only view? You need edit access to this ' + pgNoun(p) + ' — '
+          : 'Blank or asking for access? You need view access to this ' + pgNoun(p) + ' in Google Drive — '}
+          <a href="${esc(p.docUrl)}" target="_blank" rel="noopener">open it in ${esc(pgAppInfo(p).name.replace('Google Doc', 'Google Docs').replace('Google Sheet', 'Google Sheets'))}</a>.</div>
+      </div>`;
+    const bind = (id, fn) => { const b = document.getElementById(id); if (b) b.addEventListener('click', fn); };
+    bind('wgtEditDocBtn', () => pgSetDocInline(true));
+    bind('wgtDoneDocBtn', () => pgSetDocInline(false));
+    bind('wgtOpenDocBtn', () => pgOpenInDocs(p));
+    bind('wgtNewTabDocBtn', () => { pgSetDocInline(false); pgOpenInDocs(p); });
+    bind('wgtDeleteBtn', () => pgDeletePage(p));
+    bind('wgtMaxBtn', () => pgSetDocMax(pgDocMax ? '' : 'max'));
+    bind('wgtFullBtn', () => pgSetDocMax(pgDocMax === 'full' ? '' : 'full'));
+    pgBindCommentsBtn();
+    pgFindReset();
+    pgUpdateCommentBadge();
+    pgApplyPermissions();
+    pgLoadDocComments(p, 60000);
+  }
+
+  // ── Maximize / full screen for Google file pages ──
+  // Maximize: the page (its header buttons and the Google frame) fills the
+  // browser window over the wiki's header and sidebar. Full screen: the same,
+  // plus the browser's own full screen. It stays on while switching between
+  // viewing and inline editing, and ends when another page or view opens.
+  let pgDocMax = '';             // '' | 'max' | 'full'
+
+  function pgMaxButtonsHtml() {
+    const max = !!pgDocMax, full = pgDocMax === 'full';
+    return pgIconBtn('wgtMaxBtn', max ? 'restore' : 'maximize', max ? 'Restore (Esc)' : 'Maximize — fill the window') +
+           pgIconBtn('wgtFullBtn', full ? 'exitFullscreen' : 'fullscreen', full ? 'Exit full screen (Esc)' : 'Full screen');
+  }
+
+  async function pgSetDocMax(mode) {
+    if (mode === 'full' && !document.fullscreenElement) {
+      try {
+        if (!document.fullscreenEnabled) throw new Error('not allowed here');
+        await document.documentElement.requestFullscreen();
+      } catch (e) {
+        // Some embeds don't allow it; maximizing still gives most of the room.
+        mode = 'max';
+        pgToast('Full screen isn’t available here — maximized instead', 4000);
+      }
+    }
+    if (mode !== 'full' && document.fullscreenElement) {
+      try { await document.exitFullscreen(); } catch (e) { /* already out */ }
+    }
+    pgDocMax = mode || '';
+    document.body.classList.toggle('wk-doc-max', !!pgDocMax);
+    pgSyncMaxButtons();
+  }
+
+  // Swaps the two buttons' icon and label without re-rendering the page,
+  // which would reload the Google frame.
+  function pgSyncMaxButtons() {
+    const max = document.getElementById('wgtMaxBtn');
+    const full = document.getElementById('wgtFullBtn');
+    const set = (b, icon, label) => { if (!b) return; b.innerHTML = PG_ICONS[icon]; b.title = label; b.setAttribute('aria-label', label); };
+    set(max, pgDocMax ? 'restore' : 'maximize', pgDocMax ? 'Restore (Esc)' : 'Maximize — fill the window');
+    set(full, pgDocMax === 'full' ? 'exitFullscreen' : 'fullscreen', pgDocMax === 'full' ? 'Exit full screen (Esc)' : 'Full screen');
+  }
+
+  // Called whenever something other than the same Google file takes the pane.
+  function pgExitDocMax() {
+    if (!pgDocMax) return;
+    pgSetDocMax('');
+  }
+
+  // Leaving the browser's full screen (Esc, F11) restores the page too.
+  document.addEventListener('fullscreenchange', () => {
+    if (!document.fullscreenElement && pgDocMax === 'full') pgSetDocMax('');
+  });
+  // Esc restores a maximized page (while the focus is on the wiki, not inside
+  // the Google frame, which keeps its own keys).
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && pgDocMax === 'max' && !document.getElementById('wgtDialog')) pgSetDocMax('');
+  });
+
+  // Switches the open Doc between Google's viewer and its editor. While the
+  // editor is up, pgEditing holds off background refreshes that would reload
+  // the frame mid-sentence.
+  function pgSetDocInline(on) {
+    pgDocInline = !!on;
+    pgEditing = pgDocInline;
+    pgRenderPageView();   // leaving the editor loads a fresh viewer = the saved version
+    if (!pgDocInline) {
+      pgLoadPages({ fresh: true, quiet: true });   // pick up a renamed title
+      if (pgCurrent) pgLoadDocComments(pgCurrent, 0);   // and comments added while editing
+    }
+  }
+
+  // ── Rich-text editor helpers ────────────────────────────
+  let pgSavedRange = null;
+  function pgSaveSelection() {
+    const editorEl = document.getElementById('wgtEditor');
+    const sel = window.getSelection();
+    if (!editorEl || !sel || sel.rangeCount === 0) return;
+    const range = sel.getRangeAt(0);
+    if (editorEl.contains(range.commonAncestorContainer)) pgSavedRange = range.cloneRange();
+  }
+  function pgRestoreSelection() {
+    if (!pgSavedRange) return;
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(pgSavedRange);
+  }
+  // Wraps the current selection in a <span style="..."> — used for font
+  // family/size and text/highlight color, which Markdown can't express natively.
+  function pgWrapSelectionStyle(styleStr) {
+    const editorEl = document.getElementById('wgtEditor');
+    const sel = window.getSelection();
+    if (!editorEl || !sel || sel.rangeCount === 0 || sel.isCollapsed) return;
+    const range = sel.getRangeAt(0);
+    if (!editorEl.contains(range.commonAncestorContainer)) return;
+    try {
+      const span = document.createElement('span');
+      span.setAttribute('style', styleStr);
+      span.appendChild(range.extractContents());
+      range.insertNode(span);
+      const newRange = document.createRange();
+      newRange.selectNodeContents(span);
+      sel.removeAllRanges();
+      sel.addRange(newRange);
+      pgSavedRange = newRange.cloneRange();
+    } catch (e) { console.warn('pgWrapSelectionStyle failed', e); }
+  }
+  // Applies a style (e.g. line-height) to the nearest block ancestor of the
+  // selection/cursor, rather than wrapping inline text.
+  function pgApplyBlockStyle(styleStr) {
+    const editorEl = document.getElementById('wgtEditor');
+    const sel = window.getSelection();
+    if (!editorEl || !sel || sel.rangeCount === 0) return;
+    let node = sel.getRangeAt(0).commonAncestorContainer;
+    if (node.nodeType === Node.TEXT_NODE) node = node.parentElement;
+    const blockTags = ['P', 'H1', 'H2', 'H3', 'H4', 'LI', 'BLOCKQUOTE', 'DIV'];
+    while (node && node !== editorEl && !blockTags.includes(node.nodeName)) node = node.parentElement;
+    if (!node || node === editorEl) return;
+    const [prop, val] = styleStr.split(':');
+    const camel = prop.trim().replace(/-([a-z])/g, (m, c) => c.toUpperCase());
+    node.style[camel] = val.trim();
+  }
+
+  // ── Insert menu: image, media, table, link, symbols ──────
+  // Inserts HTML at the cursor, restoring the selection the editor had before
+  // the user reached for the toolbar.
+  function pgInsertHtml(html) {
+    const editorEl = document.getElementById('wgtEditor');
+    if (!editorEl) return;
+    editorEl.focus();
+    pgRestoreSelection();
+    document.execCommand('insertHTML', false, html);
+    pgSaveSelection();
+  }
+
+  // Simple tables become pipe tables; anything with merged cells or styling is
+  // left as HTML so nothing is silently lost.
+  function pgTableToMarkdown(table) {
+    const rows = Array.from(table.querySelectorAll('tr'));
+    if (!rows.length) return table.outerHTML;
+    const complex = rows.some(tr => Array.from(tr.children).some(c =>
+      c.getAttribute('style') || (c.colSpan > 1) || (c.rowSpan > 1) || c.querySelector('table, ul, ol, p + p')
+    ));
+    const widths = rows.map(r => r.children.length);
+    if (complex || Math.min.apply(null, widths) !== Math.max.apply(null, widths)) return table.outerHTML;
+
+    const cell = (c) => (c.textContent || '').replace(/\s+/g, ' ').replace(/\|/g, '\\|').trim();
+    const body = rows.map(r => Array.from(r.children).map(cell));
+    const cols = body[0].length;
+    const hasHeader = !!rows[0].querySelector('th');
+    const head = hasHeader ? body.shift() : new Array(cols).fill('');
+    let md = '| ' + head.join(' | ') + ' |\n';
+    md += '| ' + new Array(cols).fill('---').join(' | ') + ' |\n';
+    body.forEach(r => { md += '| ' + r.join(' | ') + ' |\n'; });
+    return md.trim();
+  }
+
+  // Lightweight modal used by the insert tools. `fields` is a list of
+  // { name, label, type, value, placeholder, options }.
+  // `opts`: { confirm: button label, danger: true for destructive actions,
+  //           intro: a line of explanation above the fields }
+  function pgDialog(title, fields, onSubmit, opts) {
+    const o = opts || {};
+    const host = document.getElementById('wgtShell') || document.body;
+    const old = document.getElementById('wgtDialog');
+    if (old) old.remove();
+
+    const wrap = document.createElement('div');
+    wrap.className = 'wgt-dialog-backdrop';
+    wrap.id = 'wgtDialog';
+    const rows = (fields || []).map(f => {
+      const id = 'wgtDlg_' + f.name;
+      if (f.type === 'select') {
+        const opts = (f.options || []).map(o => `<option value="${esc(o.value)}">${esc(o.label)}</option>`).join('');
+        return `<label class="wgt-dlg-row"><span>${esc(f.label)}</span><select id="${id}">${opts}</select></label>`;
+      }
+      if (f.type === 'file') {
+        return `<label class="wgt-dlg-row"><span>${esc(f.label)}</span><input type="file" id="${id}" accept="${esc(f.accept || '')}"></label>`;
+      }
+      return `<label class="wgt-dlg-row"><span>${esc(f.label)}</span><input type="${esc(f.type || 'text')}" id="${id}" value="${esc(f.value || '')}" placeholder="${esc(f.placeholder || '')}"></label>`;
+    }).join('');
+
+    wrap.innerHTML = `
+      <div class="wgt-dialog" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+        <div class="wgt-dlg-title">${esc(title)}</div>
+        <div class="wgt-dlg-body">
+          ${o.intro ? `<p class="wgt-dlg-intro">${o.intro}</p>` : ''}
+          ${rows}
+        </div>
+        <div class="wgt-dlg-actions">
+          <button class="wgt-btn" data-dlg="cancel">Cancel</button>
+          <button class="wgt-btn ${o.danger ? 'wgt-danger' : 'wgt-primary'}" data-dlg="ok">${esc(o.confirm || 'Insert')}</button>
+        </div>
+      </div>`;
+    host.appendChild(wrap);
+
+    const close = () => wrap.remove();
+    wrap.addEventListener('mousedown', (e) => { if (e.target === wrap) close(); });
+    wrap.querySelector('[data-dlg="cancel"]').addEventListener('click', close);
+    wrap.querySelector('[data-dlg="ok"]').addEventListener('click', async () => {
+      const values = {};
+      (fields || []).forEach(f => {
+        const el = document.getElementById('wgtDlg_' + f.name);
+        values[f.name] = f.type === 'file' ? (el.files && el.files[0]) : el.value;
+      });
+      close();
+      try { await onSubmit(values); }
+      catch (err) { console.error(err); pgToast((o.confirm || 'Action') + ' failed: ' + err.message, 6000); }
+    });
+    wrap.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') close();
+      if (e.key === 'Enter' && e.target.tagName === 'INPUT' && e.target.type !== 'file') {
+        e.preventDefault();
+        wrap.querySelector('[data-dlg="ok"]').click();
+      }
+    });
+    const first = wrap.querySelector('input, select');
+    if (first) first.focus();
+  }
+
+  // Images are embedded as data URIs so a page never depends on a file path
+  // that could move. Large images are downscaled first to keep pages sane.
+  function pgImageFileToDataUrl(file, maxDim, maxBytes) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onerror = () => reject(new Error('could not read file'));
+      reader.onload = () => {
+        const src = reader.result;
+        if (file.size <= maxBytes && !/^data:image\/(png|jpeg|gif|webp)/.test(src)) return resolve(src);
+        const img = new Image();
+        img.onerror = () => resolve(src);
+        img.onload = () => {
+          if (img.width <= maxDim && img.height <= maxDim && file.size <= maxBytes) return resolve(src);
+          const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+          const canvas = document.createElement('canvas');
+          canvas.width = Math.round(img.width * scale);
+          canvas.height = Math.round(img.height * scale);
+          const ctx = canvas.getContext('2d');
+          ctx.fillStyle = '#fff';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          const isPng = /^data:image\/png/.test(src);
+          resolve(canvas.toDataURL(isPng ? 'image/png' : 'image/jpeg', 0.85));
+        };
+        img.src = src;
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function pgInsertImage() {
+    pgDialog('Insert image', [
+      { name: 'file', label: 'Upload a file', type: 'file', accept: 'image/*' },
+      { name: 'url', label: '…or paste an image URL', type: 'text', placeholder: 'https://…' },
+      { name: 'alt', label: 'Alt text', type: 'text', placeholder: 'Description (for accessibility)' },
+      { name: 'width', label: 'Width', type: 'select', options: [
+        { value: '', label: 'Original size' }, { value: '25%', label: '25%' },
+        { value: '50%', label: '50%' }, { value: '75%', label: '75%' }, { value: '100%', label: 'Full width' }
+      ] }
+    ], async (v) => {
+      let src = (v.url || '').trim();
+      if (v.file) {
+        pgToast('Processing image…');
+        src = await pgImageFileToDataUrl(v.file, 1400, 300 * 1024);
+      }
+      if (!src) { pgToast('No image chosen'); return; }
+      if (!/^(https?:|data:image\/)/i.test(src)) { pgToast('Only https or uploaded images are allowed'); return; }
+      const style = v.width ? ` style="width:${v.width}"` : '';
+      pgInsertHtml(`<img src="${esc(src)}" alt="${esc(v.alt || '')}"${style}>`);
+      pgToast('Image inserted');
+    });
+  }
+
+  // Recognises YouTube/Vimeo share links and embeds them properly; anything
+  // else that looks like a video/audio file becomes a native player.
+  function pgMediaEmbedHtml(url) {
+    const u = url.trim();
+    if (!/^https:\/{2}/i.test(u)) return null;
+    let m = u.match(/(?:youtube\.com\/(?:watch\?v=|embed\/)|youtu\.be\/)([\w-]{6,})/i);
+    if (m) return `<iframe src="https://www.youtube.com/embed/${m[1]}" width="560" height="315" frameborder="0" allowfullscreen></iframe>`;
+    m = u.match(/vimeo\.com\/(?:video\/)?(\d+)/i);
+    if (m) return `<iframe src="https://player.vimeo.com/video/${m[1]}" width="560" height="315" frameborder="0" allowfullscreen></iframe>`;
+    if (/\.(mp4|webm|ogv|mov)(\?|$)/i.test(u)) return `<video src="${esc(u)}" controls width="560"></video>`;
+    if (/\.(mp3|wav|ogg|m4a)(\?|$)/i.test(u)) return `<audio src="${esc(u)}" controls></audio>`;
+    return null;
+  }
+
+  function pgInsertMedia() {
+    pgDialog('Insert video or audio', [
+      { name: 'url', label: 'Link', type: 'text', placeholder: 'YouTube, Vimeo, or a .mp4 / .mp3 URL' }
+    ], (v) => {
+      const html = pgMediaEmbedHtml(v.url || '');
+      if (!html) { pgToast('Not a recognised media link (must be https)'); return; }
+      pgInsertHtml(html + '<p><br></p>');
+      pgToast('Media inserted');
+    });
+  }
+
+  function pgInsertTable() {
+    pgDialog('Insert table', [
+      { name: 'rows', label: 'Rows (body)', type: 'number', value: '3' },
+      { name: 'cols', label: 'Columns', type: 'number', value: '3' },
+      { name: 'header', label: 'Header row', type: 'select', options: [
+        { value: 'yes', label: 'Yes' }, { value: 'no', label: 'No' }
+      ] }
+    ], (v) => {
+      const rows = Math.max(1, Math.min(50, parseInt(v.rows, 10) || 3));
+      const cols = Math.max(1, Math.min(12, parseInt(v.cols, 10) || 3));
+      let html = '<table>';
+      if (v.header === 'yes') {
+        html += '<thead><tr>';
+        for (let c = 0; c < cols; c++) html += `<th>Heading ${c + 1}</th>`;
+        html += '</tr></thead>';
+      }
+      html += '<tbody>';
+      for (let r = 0; r < rows; r++) {
+        html += '<tr>';
+        for (let c = 0; c < cols; c++) html += '<td>&nbsp;</td>';
+        html += '</tr>';
+      }
+      html += '</tbody></table><p><br></p>';
+      pgInsertHtml(html);
+      pgToast('Table inserted');
+    });
+  }
+
+  function pgInsertLink() {
+    const sel = window.getSelection();
+    const selected = sel && !sel.isCollapsed ? sel.toString().trim() : '';
+    pgDialog('Insert link', [
+      { name: 'url', label: 'Address', type: 'text', placeholder: 'https://…  or  a wiki page title' },
+      { name: 'text', label: 'Text to show', type: 'text', value: selected }
+    ], (v) => {
+      const url = (v.url || '').trim();
+      if (!url) return;
+      const label = (v.text || '').trim() || url;
+      if (/^https?:\/{2}/i.test(url)) {
+        pgInsertHtml(`<a href="${esc(url)}" target="_blank" rel="noopener">${esc(label)}</a>`);
+      } else {
+        // Not a URL — treat it as a link to another wiki page.
+        pgInsertHtml(`<a href="#" data-wikilink="${encodeURIComponent(url)}" class="wgt-wikilink">${esc(label)}</a>`);
+      }
+      pgToast('Link inserted');
+    });
+  }
+
+  // ── Editing an existing table ────────────────────────────
+  // Finds the cell the caret currently sits in, if any.
+  function pgCurrentCell() {
+    const editorEl = document.getElementById('wgtEditor');
+    const sel = window.getSelection();
+    if (!editorEl || !sel || sel.rangeCount === 0) return null;
+    let node = sel.getRangeAt(0).startContainer;
+    if (node.nodeType === Node.TEXT_NODE) node = node.parentElement;
+    if (!node || !editorEl.contains(node)) return null;
+    const cell = node.closest ? node.closest('td, th') : null;
+    if (!cell || !editorEl.contains(cell)) return null;
+    const row = cell.parentElement;
+    const table = cell.closest('table');
+    if (!table) return null;
+    return { cell, row, table, index: Array.prototype.indexOf.call(row.children, cell) };
+  }
+
+  // All rows of a table in visual order, across thead/tbody/tfoot.
+  function pgTableRows(table) { return Array.from(table.querySelectorAll('tr')); }
+
+  function pgTableInsertRow(ctx, after) {
+    const { row, table } = ctx;
+    const cols = Math.max.apply(null, pgTableRows(table).map(r => r.children.length));
+    const tr = document.createElement('tr');
+    for (let i = 0; i < cols; i++) {
+      const td = document.createElement('td');
+      td.innerHTML = '&nbsp;';
+      tr.appendChild(td);
+    }
+    // A new row never belongs in the header — put it at the top of the body.
+    if (row.parentElement.tagName === 'THEAD' && after) {
+      let tbody = table.querySelector('tbody');
+      if (!tbody) { tbody = document.createElement('tbody'); table.appendChild(tbody); }
+      tbody.insertBefore(tr, tbody.firstChild);
+    } else if (row.parentElement.tagName === 'THEAD' && !after) {
+      row.parentElement.parentElement.insertBefore(tr, row.parentElement);
+    } else {
+      row.parentElement.insertBefore(tr, after ? row.nextSibling : row);
+    }
+    pgFocusCell(tr.children[Math.min(ctx.index, tr.children.length - 1)]);
+  }
+
+  function pgTableInsertCol(ctx, after) {
+    const at = ctx.index + (after ? 1 : 0);
+    pgTableRows(ctx.table).forEach(r => {
+      const isHead = r.parentElement.tagName === 'THEAD' || r.children[0].tagName === 'TH';
+      const cell = document.createElement(isHead ? 'th' : 'td');
+      cell.innerHTML = isHead ? 'Heading' : '&nbsp;';
+      if (at >= r.children.length) r.appendChild(cell);
+      else r.insertBefore(cell, r.children[at]);
+    });
+    const rowCells = ctx.row.children;
+    pgFocusCell(rowCells[Math.min(at, rowCells.length - 1)]);
+  }
+
+  function pgTableDeleteRow(ctx) {
+    const rows = pgTableRows(ctx.table);
+    if (rows.length <= 1) return pgTableDelete(ctx);
+    const section = ctx.row.parentElement;
+    const next = ctx.row.nextElementSibling || ctx.row.previousElementSibling;
+    ctx.row.remove();
+    if (section.tagName !== 'TABLE' && !section.children.length) section.remove();
+    if (next) pgFocusCell(next.children[Math.min(ctx.index, next.children.length - 1)]);
+    pgUpdateTableTools();
+  }
+
+  function pgTableDeleteCol(ctx) {
+    const rows = pgTableRows(ctx.table);
+    const cols = Math.max.apply(null, rows.map(r => r.children.length));
+    if (cols <= 1) return pgTableDelete(ctx);
+    rows.forEach(r => { if (r.children[ctx.index]) r.children[ctx.index].remove(); });
+    const rowCells = ctx.row.children;
+    if (rowCells.length) pgFocusCell(rowCells[Math.min(ctx.index, rowCells.length - 1)]);
+    pgUpdateTableTools();
+  }
+
+  function pgTableDelete(ctx) {
+    ctx.table.remove();
+    pgHideTableTools();
+    pgToast('Table deleted');
+  }
+
+  // Turns the first row into a header row, or back into a normal row.
+  function pgTableToggleHeader(ctx) {
+    const table = ctx.table;
+    const thead = table.querySelector('thead');
+    if (thead) {
+      const tr = thead.querySelector('tr');
+      if (tr) {
+        Array.from(tr.children).forEach(th => {
+          const td = document.createElement('td');
+          td.innerHTML = th.innerHTML;
+          if (th.getAttribute('style')) td.setAttribute('style', th.getAttribute('style'));
+          th.replaceWith(td);
+        });
+        let tbody = table.querySelector('tbody');
+        if (!tbody) { tbody = document.createElement('tbody'); table.appendChild(tbody); }
+        tbody.insertBefore(tr, tbody.firstChild);
+      }
+      thead.remove();
+    } else {
+      const first = pgTableRows(table)[0];
+      if (!first) return;
+      Array.from(first.children).forEach(td => {
+        const th = document.createElement('th');
+        th.innerHTML = td.innerHTML;
+        if (td.getAttribute('style')) th.setAttribute('style', td.getAttribute('style'));
+        td.replaceWith(th);
+      });
+      const head = document.createElement('thead');
+      head.appendChild(first);
+      table.insertBefore(head, table.firstChild);
+    }
+    pgUpdateTableTools();
+  }
+
+  function pgFocusCell(cell) {
+    if (!cell) return;
+    const range = document.createRange();
+    range.selectNodeContents(cell);
+    range.collapse(true);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    pgSavedRange = range.cloneRange();
+    pgUpdateTableTools();
+  }
+
+  function pgHideTableTools() {
+    const el = document.getElementById('wgtTableTools');
+    if (el) el.style.display = 'none';
+  }
+
+  // Shows the table bar above whichever table the caret is inside; hides it
+  // as soon as the caret leaves.
+  function pgUpdateTableTools() {
+    const bar = document.getElementById('wgtTableTools');
+    if (!bar) return;
+    if (!pgEditing) { bar.style.display = 'none'; return; }
+    const ctx = pgCurrentCell();
+    if (!ctx) { bar.style.display = 'none'; return; }
+    bar.style.display = 'flex';
+    const r = ctx.table.getBoundingClientRect();
+    const top = r.top - bar.offsetHeight - 6;
+    bar.style.top = Math.max(8, top) + 'px';
+    bar.style.left = Math.max(8, r.left) + 'px';
+  }
+
+  function pgWireTableTools() {
+    const bar = document.getElementById('wgtTableTools');
+    const editorEl = document.getElementById('wgtEditor');
+    if (!bar || !editorEl) return;
+    bar.querySelectorAll('[data-tt]').forEach(btn => {
+      btn.addEventListener('mousedown', (e) => e.preventDefault());
+      btn.addEventListener('click', () => {
+        const ctx = pgCurrentCell();
+        if (!ctx) { pgHideTableTools(); return; }
+        switch (btn.dataset.tt) {
+          case 'row-above':  pgTableInsertRow(ctx, false); break;
+          case 'row-below':  pgTableInsertRow(ctx, true);  break;
+          case 'col-left':   pgTableInsertCol(ctx, false); break;
+          case 'col-right':  pgTableInsertCol(ctx, true);  break;
+          case 'header':     pgTableToggleHeader(ctx);     break;
+          case 'del-row':    pgTableDeleteRow(ctx);        break;
+          case 'del-col':    pgTableDeleteCol(ctx);        break;
+          case 'del-table':  pgTableDelete(ctx);           break;
+        }
+      });
+    });
+    ['keyup', 'mouseup', 'focus', 'input'].forEach(ev =>
+      editorEl.addEventListener(ev, () => setTimeout(pgUpdateTableTools, 0)));
+    editorEl.addEventListener('blur', () => setTimeout(() => {
+      if (!document.activeElement || !document.activeElement.closest('#wgtTableTools')) pgHideTableTools();
+    }, 150));
+    // Tab moves to the next cell, like a spreadsheet.
+    editorEl.addEventListener('keydown', (e) => {
+      if (e.key !== 'Tab') return;
+      const ctx = pgCurrentCell();
+      if (!ctx) return;
+      e.preventDefault();
+      const cells = Array.from(ctx.table.querySelectorAll('td, th'));
+      const i = cells.indexOf(ctx.cell);
+      const next = cells[i + (e.shiftKey ? -1 : 1)];
+      if (next) pgFocusCell(next);
+      else if (!e.shiftKey) { pgTableInsertRow(ctx, true); }
+    });
+  }
+
+  const PG_SYMBOL_GROUPS = [
+    ['Common',    ['©', '®', '™', '§', '¶', '†', '‡', '•', '·', '…', '–', '—', '“', '”', '‘', '’', '«', '»']],
+    ['Arrows',    ['←', '→', '↑', '↓', '↔', '⇐', '⇒', '⇔', '↵', '⟶', '➜', '▶', '◀', '▲', '▼']],
+    ['Marks',     ['✓', '✔', '✗', '✘', '☑', '☐', '★', '☆', '⚑', '⚠', 'ℹ', '❗', '❓', '⏳', '🔒']],
+    ['Maths',     ['±', '×', '÷', '≠', '≈', '≤', '≥', '∞', '√', '∑', '∏', '∆', '°', '′', '″', '½', '¼', '¾']],
+    ['Currency',  ['€', '£', '¥', '¢', '₹', '₱', '₩', '₽', '$']],
+    ['Greek',     ['α', 'β', 'γ', 'δ', 'ε', 'θ', 'λ', 'μ', 'π', 'σ', 'φ', 'ω', 'Ω', 'Δ', 'Σ', 'Φ']]
+  ];
+
+  function pgToggleSymbolPalette(anchorBtn) {
+    const existing = document.getElementById('wgtSymbols');
+    if (existing) { existing.remove(); return; }
+    const host = document.getElementById('wgtShell') || document.body;
+    const pal = document.createElement('div');
+    pal.className = 'wgt-symbols';
+    pal.id = 'wgtSymbols';
+    pal.innerHTML = PG_SYMBOL_GROUPS.map(([name, chars]) =>
+      `<div class="wgt-sym-group"><div class="wgt-sym-label">${esc(name)}</div><div class="wgt-sym-grid">` +
+      chars.map(c => `<button type="button" class="wgt-sym" data-sym="${esc(c)}">${esc(c)}</button>`).join('') +
+      `</div></div>`
+    ).join('');
+    host.appendChild(pal);
+
+    const r = anchorBtn.getBoundingClientRect();
+    const hr = host.getBoundingClientRect();
+    pal.style.left = Math.max(8, Math.min(r.left - hr.left, hr.width - 320)) + 'px';
+    pal.style.top = (r.bottom - hr.top + 6) + 'px';
+
+    pal.querySelectorAll('.wgt-sym').forEach(b => {
+      b.addEventListener('mousedown', (e) => e.preventDefault());
+      b.addEventListener('click', () => { pgInsertHtml(b.dataset.sym); });
+    });
+    setTimeout(() => {
+      const away = (e) => {
+        if (!pal.contains(e.target) && e.target !== anchorBtn) { pal.remove(); document.removeEventListener('mousedown', away); }
+      };
+      document.addEventListener('mousedown', away);
+    }, 0);
+  }
+
+  // Reflects the formatting at the caret back into the toolbar — the bold button
+  // lights up inside bold text, the font/size boxes show what's actually there.
+  function pgSyncToolbarState() {
+    const editorEl = document.getElementById('wgtEditor');
+    const toolbar = document.getElementById('wgtRteToolbar');
+    if (!editorEl || !toolbar || !pgEditing) return;
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0) return;
+    let node = sel.getRangeAt(0).startContainer;
+    if (node.nodeType === Node.TEXT_NODE) node = node.parentElement;
+    if (!node || !editorEl.contains(node)) return;
+
+    ['bold', 'italic', 'underline', 'strikeThrough', 'insertUnorderedList',
+     'insertOrderedList', 'justifyLeft', 'justifyCenter', 'justifyRight', 'justifyFull'
+    ].forEach(cmd => {
+      const btn = toolbar.querySelector(`[data-cmd="${cmd}"]`);
+      if (!btn) return;
+      let on = false;
+      try { on = document.queryCommandState(cmd); } catch (e) {}
+      btn.classList.toggle('wgt-active', !!on);
+    });
+
+    const cs = window.getComputedStyle(node);
+    const sizeBox = document.getElementById('wgtFontSize');
+    if (sizeBox && document.activeElement !== sizeBox) {
+      const px = parseFloat(cs.fontSize) || 0;
+      if (px) sizeBox.value = String(Math.round(px * 0.75 * 10) / 10); // px -> pt
+    }
+    const fontSel = document.getElementById('wgtFontFamily');
+    if (fontSel) {
+      const fam = (cs.fontFamily || '').split(',')[0].replace(/[\x27\x22]/g, '').toLowerCase();
+      const match = Array.from(fontSel.options).find(o =>
+        o.value.split(',')[0].replace(/[\x27\x22]/g, '').toLowerCase() === fam);
+      if (match) fontSel.value = match.value;
+    }
+    const blockSel = document.getElementById('wgtBlockFormat');
+    if (blockSel) {
+      let b = node;
+      const tags = ['H1', 'H2', 'H3', 'H4', 'BLOCKQUOTE', 'P'];
+      while (b && b !== editorEl && !tags.includes(b.nodeName)) b = b.parentElement;
+      const tag = b && b !== editorEl ? b.nodeName : 'P';
+      if (Array.from(blockSel.options).some(o => o.value === tag)) blockSel.value = tag;
+    }
+  }
+
+  function pgWireRteToolbar() {
+    const toolbar = document.getElementById('wgtRteToolbar');
+    const editorEl = document.getElementById('wgtEditor');
+    if (!toolbar || !editorEl) return;
+    try { document.execCommand('styleWithCSS', false, false); } catch (e) {}
+
+    editorEl.addEventListener('mouseup', pgSaveSelection);
+    editorEl.addEventListener('keyup', pgSaveSelection);
+    editorEl.addEventListener('focus', pgSaveSelection);
+    ['keyup', 'mouseup', 'focus'].forEach(ev =>
+      editorEl.addEventListener(ev, () => setTimeout(pgSyncToolbarState, 0)));
+
+    // Docs-style shortcut: Ctrl/Cmd+K inserts a link.
+    editorEl.addEventListener('keydown', (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        pgSaveSelection();
+        pgInsertLink();
+      }
+    });
+
+    toolbar.querySelectorAll('[data-cmd]').forEach(btn => {
+      btn.addEventListener('mousedown', (e) => e.preventDefault());
+      btn.addEventListener('click', () => {
+        editorEl.focus();
+        pgRestoreSelection();
+        document.execCommand(btn.dataset.cmd, false, null);
+        pgSaveSelection();
+      });
+    });
+
+    const blockFormat = document.getElementById('wgtBlockFormat');
+    if (blockFormat) {
+      blockFormat.addEventListener('mousedown', pgSaveSelection);
+      blockFormat.addEventListener('change', () => {
+        editorEl.focus();
+        pgRestoreSelection();
+        document.execCommand('formatBlock', false, blockFormat.value);
+        pgSaveSelection();
+      });
+    }
+    const fontFamily = document.getElementById('wgtFontFamily');
+    if (fontFamily) {
+      fontFamily.addEventListener('mousedown', pgSaveSelection);
+      fontFamily.addEventListener('change', () => {
+        if (!fontFamily.value) return;
+        editorEl.focus();
+        pgRestoreSelection();
+        pgWrapSelectionStyle('font-family:' + fontFamily.value);
+      });
+    }
+    // Font size behaves like the Docs stepper: a typed box with − / + buttons,
+    // in points rather than pixels.
+    const fontSize = document.getElementById('wgtFontSize');
+    const applySize = (pt) => {
+      const v = Math.max(6, Math.min(96, parseFloat(pt) || 11));
+      if (fontSize) fontSize.value = String(v);
+      editorEl.focus();
+      pgRestoreSelection();
+      pgWrapSelectionStyle('font-size:' + v + 'pt');
+    };
+    if (fontSize) {
+      fontSize.addEventListener('mousedown', pgSaveSelection);
+      fontSize.addEventListener('change', () => applySize(fontSize.value));
+      fontSize.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); applySize(fontSize.value); }
+        if (e.key === 'ArrowUp') { e.preventDefault(); applySize((parseFloat(fontSize.value) || 11) + 1); }
+        if (e.key === 'ArrowDown') { e.preventDefault(); applySize((parseFloat(fontSize.value) || 11) - 1); }
+      });
+    }
+    [['wgtSizeDown', -1], ['wgtSizeUp', 1]].forEach(([id, delta]) => {
+      const btn = document.getElementById(id);
+      if (!btn) return;
+      btn.addEventListener('mousedown', (e) => { e.preventDefault(); pgSaveSelection(); });
+      btn.addEventListener('click', () => applySize((parseFloat(fontSize && fontSize.value) || 11) + delta));
+    });
+    const textColor = document.getElementById('wgtTextColor');
+    if (textColor) {
+      textColor.addEventListener('mousedown', pgSaveSelection);
+      textColor.addEventListener('change', () => {
+        editorEl.focus();
+        pgRestoreSelection();
+        pgWrapSelectionStyle('color:' + textColor.value);
+      });
+    }
+    const hiliteColor = document.getElementById('wgtHiliteColor');
+    if (hiliteColor) {
+      hiliteColor.addEventListener('mousedown', pgSaveSelection);
+      hiliteColor.addEventListener('change', () => {
+        editorEl.focus();
+        pgRestoreSelection();
+        pgWrapSelectionStyle('background-color:' + hiliteColor.value);
+      });
+    }
+    const clearBtn = document.getElementById('wgtClearFormat');
+    if (clearBtn) {
+      clearBtn.addEventListener('mousedown', (e) => e.preventDefault());
+      clearBtn.addEventListener('click', () => {
+        editorEl.focus();
+        pgRestoreSelection();
+        document.execCommand('removeFormat', false, null);
+      });
+    }
+    const lineSpacing = document.getElementById('wgtLineSpacing');
+    if (lineSpacing) {
+      lineSpacing.addEventListener('mousedown', pgSaveSelection);
+      lineSpacing.addEventListener('change', () => {
+        if (!lineSpacing.value) return;
+        pgRestoreSelection();
+        pgApplyBlockStyle('line-height:' + lineSpacing.value);
+        lineSpacing.value = '';
+      });
+    }
+
+    // Insert menu. mousedown/preventDefault keeps the caret where it was so the
+    // content lands at the cursor rather than at the start of the document.
+    [
+      ['wgtInsertImage',  pgInsertImage],
+      ['wgtInsertMedia',  pgInsertMedia],
+      ['wgtInsertTable',  pgInsertTable],
+      ['wgtInsertLink',   pgInsertLink],
+      ['wgtInsertRule',   () => pgInsertHtml('<hr><p><br></p>')]
+    ].forEach(([id, fn]) => {
+      const btn = document.getElementById(id);
+      if (!btn) return;
+      btn.addEventListener('mousedown', (e) => { e.preventDefault(); pgSaveSelection(); });
+      btn.addEventListener('click', fn);
+    });
+    const symBtn = document.getElementById('wgtInsertSymbol');
+    if (symBtn) {
+      symBtn.addEventListener('mousedown', (e) => { e.preventDefault(); pgSaveSelection(); });
+      symBtn.addEventListener('click', () => pgToggleSymbolPalette(symBtn));
+    }
+
+    // Paste as plain-ish text: strips Word/Google Docs wrapper markup that would
+    // otherwise drag in fonts and classes, but keeps images pasted from files.
+    editorEl.addEventListener('paste', (e) => {
+      const html = e.clipboardData && e.clipboardData.getData('text/html');
+      if (!html) return;
+      e.preventDefault();
+      const clean = window.DOMPurify
+        ? DOMPurify.sanitize(html, { ADD_ATTR: ['style'], ADD_DATA_URI_TAGS: ['img'], FORBID_TAGS: ['style', 'meta', 'link'] })
+        : html.replace(/<[^>]+>/g, '');
+      document.execCommand('insertHTML', false, clean);
+      pgSaveSelection();
+    });
+
+    pgWireTableTools();
+  }
+
+  async function pgRenderPageEditor() {
+    const p = pgCurrent;
+    const contentEl = document.getElementById('wgtContent');
+    if (!p || !contentEl) return;
+    pgEditing = true;
+    await pgLoadTurndownLib();
+
+    const initialHtml = pgContentToHtml(p.content, pgPageIsHtml(p));
+    contentEl.classList.remove('wgt-content-doc');
+
+    contentEl.innerHTML = `
+      <div class="wgt-page-header">
+        ${pgPageTitleHtml(p)}
+        <div class="wgt-page-actions">
+          <button type="button" class="wk-pa-ghost" id="wgtCancelBtn">Cancel</button>
+          <button type="button" class="wk-pa-primary" id="wgtSaveBtn">${PG_ICONS.check}<span>Save</span></button>
+        </div>
+      </div>
+      <div class="wgt-editor-wrap">
+        <div class="wgt-rte-toolbar" id="wgtRteToolbar">
+          <button type="button" class="wgt-rte-btn" data-cmd="undo" title="Undo (Ctrl+Z)">↶</button>
+          <button type="button" class="wgt-rte-btn" data-cmd="redo" title="Redo (Ctrl+Y)">↷</button>
+          <button type="button" class="wgt-rte-btn" id="wgtClearFormat" title="Clear formatting">⌧</button>
+          <span class="wgt-rte-sep"></span>
+
+          <select class="wgt-rte-select wgt-w-style" id="wgtBlockFormat" title="Styles">
+            <option value="P">Normal text</option>
+            <option value="H1">Title</option>
+            <option value="H2">Heading 1</option>
+            <option value="H3">Heading 2</option>
+            <option value="H4">Heading 3</option>
+            <option value="BLOCKQUOTE">Quote</option>
+          </select>
+          <select class="wgt-rte-select wgt-w-font" id="wgtFontFamily" title="Font">
+            <option value="Arial, sans-serif">Arial</option>
+            <option value="Georgia, serif">Georgia</option>
+            <option value="'Times New Roman', serif">Times New Roman</option>
+            <option value="'Courier New', monospace">Courier New</option>
+            <option value="Verdana, sans-serif">Verdana</option>
+            <option value="'Trebuchet MS', sans-serif">Trebuchet MS</option>
+            <option value="'Comic Sans MS', cursive">Comic Sans MS</option>
+            <option value="Impact, sans-serif">Impact</option>
+          </select>
+          <span class="wgt-rte-stepper">
+            <button type="button" class="wgt-rte-step" id="wgtSizeDown" title="Decrease font size">−</button>
+            <input type="text" id="wgtFontSize" class="wgt-rte-sizebox" value="11" title="Font size" />
+            <button type="button" class="wgt-rte-step" id="wgtSizeUp" title="Increase font size">+</button>
+          </span>
+          <span class="wgt-rte-sep"></span>
+
+          <button type="button" class="wgt-rte-btn" data-cmd="bold" title="Bold (Ctrl+B)"><b>B</b></button>
+          <button type="button" class="wgt-rte-btn" data-cmd="italic" title="Italic (Ctrl+I)"><i>I</i></button>
+          <button type="button" class="wgt-rte-btn" data-cmd="underline" title="Underline (Ctrl+U)"><u>U</u></button>
+          <button type="button" class="wgt-rte-btn" data-cmd="strikeThrough" title="Strikethrough"><s>S</s></button>
+          <label class="wgt-rte-color" title="Text colour"><span class="wgt-rte-colorglyph">A</span><input type="color" id="wgtTextColor" value="#1a1a1a"></label>
+          <label class="wgt-rte-color" title="Highlight colour"><span class="wgt-rte-colorglyph wgt-hl-glyph">▮</span><input type="color" id="wgtHiliteColor" value="#fdf099"></label>
+          <span class="wgt-rte-sep"></span>
+
+          <button type="button" class="wgt-rte-btn" id="wgtInsertLink" title="Insert link (Ctrl+K)">🔗</button>
+          <button type="button" class="wgt-rte-btn" id="wgtInsertImage" title="Insert image">🖼</button>
+          <button type="button" class="wgt-rte-btn" id="wgtInsertTable" title="Insert table">▦</button>
+          <button type="button" class="wgt-rte-btn" id="wgtInsertMedia" title="Insert video or audio">🎬</button>
+          <button type="button" class="wgt-rte-btn" id="wgtInsertSymbol" title="Special characters">Ω</button>
+          <button type="button" class="wgt-rte-btn" id="wgtInsertRule" title="Horizontal line">―</button>
+          <span class="wgt-rte-sep"></span>
+
+          <button type="button" class="wgt-rte-btn" data-cmd="justifyLeft" title="Align left">◧</button>
+          <button type="button" class="wgt-rte-btn" data-cmd="justifyCenter" title="Align centre">▣</button>
+          <button type="button" class="wgt-rte-btn" data-cmd="justifyRight" title="Align right">◨</button>
+          <button type="button" class="wgt-rte-btn" data-cmd="justifyFull" title="Justify">▤</button>
+          <select class="wgt-rte-select wgt-w-space" id="wgtLineSpacing" title="Line spacing">
+            <option value="">↕</option>
+            <option value="1">Single</option>
+            <option value="1.15">1.15</option>
+            <option value="1.5">1.5</option>
+            <option value="2">Double</option>
+          </select>
+          <span class="wgt-rte-sep"></span>
+
+          <button type="button" class="wgt-rte-btn" data-cmd="insertUnorderedList" title="Bulleted list">☰</button>
+          <button type="button" class="wgt-rte-btn" data-cmd="insertOrderedList" title="Numbered list">⒈</button>
+          <button type="button" class="wgt-rte-btn" data-cmd="outdent" title="Decrease indent">⇤</button>
+          <button type="button" class="wgt-rte-btn" data-cmd="indent" title="Increase indent">⇥</button>
+        </div>
+        <div class="wgt-doc-canvas">
+          <div class="wgt-doc-page">
+            <div class="wgt-view wgt-editor wgt-rte${pgIsNativeDoc(p.content) ? ' wgt-doc-native' : ''}" id="wgtEditor" contenteditable="true" spellcheck="true" data-placeholder="Start writing…">${initialHtml}</div>
+          </div>
+        </div>
+      </div>
+    `;
+    const saveBtn = document.getElementById('wgtSaveBtn');
+    const cancelBtn = document.getElementById('wgtCancelBtn');
+    if (saveBtn) saveBtn.addEventListener('click', pgSavePage);
+    if (cancelBtn) cancelBtn.addEventListener('click', () => { pgEditing = false; pgHideTableTools(); pgRenderPageView(); });
+    pgWireRteToolbar();
+  }
+
+  async function pgSavePage() {
+    const p = pgCurrent;
+    const editor = document.getElementById('wgtEditor');
+    if (!p || !editor) return;
+    if (!pgCan('edit')) return pgRequire('edit');
+    let newContent;
+    if (pgPageIsHtml(p)) {
+      // Pages are HTML now, so save what the editor is already holding.
+      // Converting to Markdown here would undo the formatting.
+      newContent = editor.innerHTML;
+    } else {
+      // A legacy .md page — keep it Markdown rather than silently changing
+      // the format of a file someone may be reading outside the wiki.
+      await pgLoadTurndownLib();
+      try {
+        newContent = pgTurndown ? pgTurndown.turndown(editor.innerHTML) : editor.innerText;
+      } catch (err) {
+        console.error(err);
+        newContent = editor.innerText;
+      }
+    }
+    await pgCommitSave(p, newContent, false);
+  }
+
+  // `force` skips the check for someone else having saved in the meantime —
+  // only ever passed after the reader has been told and chosen to overwrite.
+  async function pgCommitSave(p, newContent, force) {
+    const btn = document.getElementById('wgtSaveBtn');
+    if (btn) { btn.disabled = true; btn.innerHTML = '<span>Saving…</span>'; }
+    const resetBtn = () => {
+      const b = document.getElementById('wgtSaveBtn');
+      if (b) { b.disabled = false; b.innerHTML = PG_ICONS.check + '<span>Save</span>'; }
+    };
+    try {
+      const res = await pgCall('savePage', p.id, newContent, p.rev, !!force);
+      if (res.conflict) {
+        resetBtn();
+        // The editor stays open behind the dialog, so nothing is lost either way.
+        pgDialog('This page changed while you were editing', [], () => pgCommitSave(p, newContent, true), {
+          confirm: 'Overwrite with my version',
+          danger: true,
+          intro: 'Someone else saved <strong>' + esc(p.title) + '</strong> at ' + esc(pgFmtTime(res.modified)) +
+                 '. Saving now replaces their changes with yours.<br><br>Cancel to keep editing — copy ' +
+                 'anything you need, then open the page again to see their version.'
+        });
+        return;
+      }
+      Object.assign(p, {
+        content: newContent, title: res.title, snippet: res.snippet,
+        rev: res.rev, modified: res.modified
+      });
+      pgSortPages();
+      pgEditing = false;
+      pgHideTableTools();
+      pgToast('Saved');
+      pgRenderSidebar(pgSearchValue());
+      pgCurrent = p;
+      pgRenderPageView();
+    } catch (err) {
+      console.error(err);
+      resetBtn();
+      pgToast('Save failed: ' + pgErrMsg(err), 8000);
+    }
+  }
+
+  function pgDeletePage(p) {
+    if (!pgCan('delete')) return pgRequire('delete');
+    if (p.kind === 'link') {
+      pgDialog('Remove link', [], () => pgDoDeletePage(p), {
+        confirm: 'Remove link',
+        danger: true,
+        intro: 'Remove <strong>' + esc(p.title) + '</strong> from the wiki? Only the link goes — ' +
+               'the ' + esc(p.office ? pgNoun(p) : pgAppInfo(p).name) + ' itself is not deleted or changed.'
+      });
+      return;
+    }
+    pgDialog('Delete page', [], () => pgDoDeletePage(p), {
+      confirm: 'Delete page',
+      danger: true,
+      intro: 'Delete <strong>' + esc(p.title) + '</strong>? It moves to Google Drive\'s trash, ' +
+             'where the folder\'s owner can restore it for 30 days.'
+    });
+  }
+
+  async function pgDoDeletePage(p) {
+    try {
+      await pgCall('deletePage', p.id);
+      pgPages = pgPages.filter(x => x !== p);
+      pgCurrent = null;
+      pgHideCommentsPanel();
+      pgRenderSidebar(pgSearchValue());
+      const next = pgPages.find(x => (x.folder || '') === pgFolder);
+      if (next) pgOpenPage(next); else pgShowCreatePrompt();
+      pgToast('Deleted');
+    } catch (err) {
+      console.error(err);
+      pgToast('Delete failed: ' + pgErrMsg(err), 7000);
+    }
+  }
+
+  // Creates a Drive folder inside whichever folder is open, then switches to
+  // it — so the next upload or new page lands there.
+  // Keep folder names human-readable — strip only what a filesystem refuses.
+  function pgCleanFolderName(raw) {
+    return String(raw || '').trim().replace(/[\\/:*?\x22<>|]/g, '').replace(/\s+/g, ' ').trim();
+  }
+
+  function pgCreateFolder() {
+    if (!pgCan('add')) return pgRequire('add');
+    pgDialog('New folder', [
+      { name: 'name', label: 'Folder name', type: 'text', placeholder: 'e.g. QA Templates' }
+    ], (v) => pgDoCreateFolder(v.name), {
+      confirm: 'Create folder',
+      intro: pgFolder
+        ? 'Created inside <strong>' + esc(pgFolderLabel(pgFolder)) + '</strong>.'
+        : 'Created in <strong>' + esc(PG_SPACE) + '</strong>. Uploads go to whichever folder is open.'
+    });
+  }
+
+  async function pgDoCreateFolder(raw) {
+    const name = pgCleanFolderName(raw);
+    if (!name) { pgToast('That name can\'t be used for a folder'); return; }
+    const path = pgFolder ? pgFolder + '/' + name : name;
+    if (pgFolders().indexOf(path) !== -1) {
+      pgToast('"' + name + '" already exists');
+      pgFolder = path;
+      pgRenderSidebar('');
+      pgShowCreatePrompt();
+      return;
+    }
+    try {
+      await pgCall('createFolder', path);
+      if (pgFolderList.indexOf(path) === -1) pgFolderList.push(path);
+      pgFolder = path;
+      pgRenderSidebar('');
+      pgShowCreatePrompt();
+      pgToast('Created folder "' + name + '"');
+    } catch (err) {
+      console.error(err);
+      pgToast("Couldn't create the folder: " + pgErrMsg(err), 7000);
+    }
+  }
+
+  // ── Renaming and deleting folders ───────────────────────
+  function pgRenameFolder(path) {
+    if (!pgCan('edit')) return pgRequire('edit');
+    if (!path) return;
+    pgDialog('Rename folder', [
+      { name: 'name', label: 'Folder name', type: 'text', value: pgFolderLabel(path) }
+    ], (v) => pgDoRenameFolder(path, v.name), { confirm: 'Rename' });
+  }
+
+  async function pgDoRenameFolder(path, raw) {
+    const name = pgCleanFolderName(raw);
+    if (!name || name === pgFolderLabel(path)) return;
+    const parentPath = path.split('/').slice(0, -1).join('/');
+    const newPath = parentPath ? parentPath + '/' + name : name;
+    if (pgFolders().indexOf(newPath) !== -1) { pgToast('"' + name + '" already exists'); return; }
+
+    try {
+      pgToast('Renaming…', 30000);
+      await pgCall('renameFolder', path, name);
+      if (pgFolder === path || pgFolder.indexOf(path + '/') === 0) {
+        pgFolder = newPath + pgFolder.slice(path.length);
+      }
+      await pgLoadPages({ fresh: true, quiet: true });   // every path under it changed
+      pgToast('Renamed to "' + name + '"');
+    } catch (err) {
+      console.error(err);
+      pgToast("Couldn't rename the folder: " + pgErrMsg(err), 7000);
+    }
+  }
+
+  function pgDeleteFolder(path) {
+    if (!pgCan('delete')) return pgRequire('delete');
+    if (!path) return;
+    const count = pgPages.filter(p => (p.folder || '') === path || (p.folder || '').indexOf(path + '/') === 0).length;
+    pgDialog('Delete folder', [], () => pgDoDeleteFolder(path), {
+      confirm: 'Delete folder',
+      danger: true,
+      intro: 'Delete <strong>' + esc(pgFolderLabel(path)) + '</strong>' +
+        (count ? ' and the ' + count + ' page' + (count === 1 ? '' : 's') + ' inside it' : '') +
+        '? The folder moves to Google Drive\'s trash, where its owner can restore it for 30 days.'
+    });
+  }
+
+  async function pgDoDeleteFolder(path) {
+    try {
+      await pgCall('deleteFolder', path);
+      const parentPath = path.split('/').slice(0, -1).join('/');
+      if (pgFolder === path || pgFolder.indexOf(path + '/') === 0) pgFolder = parentPath;
+      await pgLoadPages({ fresh: true });
+      pgToast('Deleted folder');
+    } catch (err) {
+      console.error(err);
+      pgToast("Couldn't delete the folder: " + pgErrMsg(err), 7000);
+    }
+  }
+
+  function pgCreateNewPage(prefillTitle) {
+    if (!pgCan('add')) return pgRequire('add');
+    if (prefillTitle) return pgDoCreateNewPage(prefillTitle);
+    pgDialog('New page', [
+      { name: 'title', label: 'Page title', type: 'text', placeholder: 'e.g. Banner QA checklist' }
+    ], (v) => pgDoCreateNewPage(v.title), {
+      confirm: 'Create page',
+      intro: 'Saved in <strong>' + esc(pgFolderLabel(pgFolder)) + '</strong>.'
+    });
+  }
+
+  // Adds a page the server has just created to the list, with the content we
+  // already hold so opening it needs no second trip.
+  function pgAddCreatedPage(info, content) {
+    const page = pgPageFromRow(info);
+    if (!pgIsDocPage(page)) {
+      page.content = content;
+      page.annotations = { highlights: [], comments: [] };
+    }
+    pgPages.push(page);
+    return page;
+  }
+
+  // New pages are Google Docs, opened straight into the embedded editor.
+  async function pgDoCreateNewPage(title) {
+    if (!title || !title.trim()) return;
+    try {
+      pgToast('Creating…', 20000);
+      const info = await pgCall('createDoc', pgFolder, title.trim(), '<h1>' + esc(title.trim()) + '</h1><p></p>');
+      const page = pgAddCreatedPage(info, null);
+      pgSortPages();
+      pgOpenPage(page);
+      pgSetDocInline(true);
+      pgToast('Created "' + page.title + '" — start writing', 5000);
+    } catch (err) {
+      console.error(err);
+      pgToast("Couldn't create page: " + pgErrMsg(err), 7000);
+    }
+  }
+
+  // ── Google Docs: open, link, and pick up edits ──────────
+  let pgDocEditPending = null;   // the Doc page last sent to Google Docs
+
+  function pgOpenInDocs(page) {
+    pgDocEditPending = page;
+    window.open(page.docUrl, '_blank', 'noopener');
+  }
+  // Called when the reader comes back to this tab: show the Doc as it is now.
+  function pgRefreshEditedDoc() {
+    const page = pgDocEditPending;
+    if (!page) return false;
+    pgDocEditPending = null;
+    delete pgDocComments[page.id];
+    if (pgCurrent === page && !pgSearchValue()) pgRenderPageView();   // fresh viewer = latest version
+    return true;
+  }
+
+  function pgLinkDoc() {
+    if (!pgCan('link')) return pgRequire('link');
+    pgDialog('Link a Google file', [
+      { name: 'url', label: 'Google Docs, Sheets, Slides — or a Word, Excel or PowerPoint file in Drive', type: 'text', placeholder: 'https://docs.google.com/…/d/…' }
+    ], (v) => pgDoLinkDoc(v.url), {
+      confirm: 'Add to wiki',
+      intro: 'Adds it to <strong>' + esc(pgFolderLabel(pgFolder)) + '</strong>. The file stays where it is, ' +
+             'with its owner and sharing unchanged — readers need access to it in Google to view or edit it.'
+    });
+  }
+
+  async function pgDoLinkDoc(url) {
+    if (!url || !url.trim()) return;
+    try {
+      pgToast('Linking…', 20000);
+      const info = await pgCall('linkDoc', pgFolder, url.trim());
+      const page = pgAddCreatedPage(info, null);
+      pgSortPages();
+      pgOpenPage(page);
+      pgToast('Linked "' + page.title + '"');
+    } catch (err) {
+      console.error(err);
+      pgToast("Couldn't link that file: " + pgErrMsg(err), 8000);
+    }
+  }
+
+  // ── Upload & convert to HTML ────────────────────────────
+  // Everything becomes HTML on the way in. HTML is what the editor and the
+  // viewer both work in, so storing it avoids a lossy round trip through
+  // Markdown — which is what used to flatten Word formatting.
+  async function pgConvertToHtml(file) {
+    const name = file.name.toLowerCase();
+
+    if (name.endsWith('.html') || name.endsWith('.htm')) {
+      let html = await file.text();
+      // A saved web page is a whole document — keep only what goes in the body.
+      const body = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+      if (body) html = body[1];
+      html = html.replace(/<(script|style|meta|link|title)[^>]*>[\s\S]*?<\/\1>/gi, '')
+                 .replace(/<(meta|link)[^>]*>/gi, '');
+      html = pgTidyDocxHtml(html);
+      if (!/<h1[\s>]/i.test(html)) {
+        html = '<h1>' + esc(pgTitleFromFilename(file.name)) + '</h1>\n' + html;
+      }
+      return html;
+    }
+    if (name.endsWith('.docx')) {
+      return await pgDocxToHtml(file);
+    }
+    if (name.endsWith('.md') || name.endsWith('.markdown')) {
+      const text = await file.text();
+      return pgMarkdownToHtml(text, file.name);
+    }
+    if (name.endsWith('.txt')) {
+      const text = await file.text();
+      const paras = text.split(/\n{2,}/).map(p => p.trim()).filter(Boolean)
+        .map(p => '<p>' + esc(p).replace(/\n/g, '<br>') + '</p>').join('\n');
+      return '<h1>' + esc(pgTitleFromFilename(file.name)) + '</h1>\n' + paras;
+    }
+    if (name.endsWith('.pdf')) {
+      // The PDF reader reconstructs layout as Markdown; render it once here so
+      // the stored page is HTML like everything else.
+      return pgMarkdownToHtml(await pgPdfToMarkdown(file), file.name);
+    }
+    throw new Error('Unsupported file type — use .docx, .pdf, .txt, .md or .html');
+  }
+
+  async function pgMarkdownToHtml(md, filename) {
+    await pgLoadViewLibs();
+    const html = window.marked ? marked.parse(md) : '<pre>' + esc(md) + '</pre>';
+    if (/<h1[\s>]/i.test(html)) return html;
+    return '<h1>' + esc(pgTitleFromFilename(filename || 'Untitled')) + '</h1>\n' + html;
+  }
+
+  // ── Word → HTML ─────────────────────────────────────────
+  // Two converters, tried in order:
+  //
+  //   docx-preview — reads the same XML Word does and reproduces the document's
+  //     actual design: fonts, sizes, colours, table borders and shading,
+  //     numbering, indents, images. This is what keeps an imported page looking
+  //     like the original.
+  //
+  //   mammoth — the fallback. It is a *semantic* converter by design and throws
+  //     away direct formatting, so pages come through plain. Only used when the
+  //     faithful renderer can't load (no internet on first use, say).
+  async function pgDocxToHtml(file) {
+    try {
+      const faithful = await pgDocxRenderFaithful(file);
+      if (faithful) return faithful;
+    } catch (err) {
+      console.warn('docx-preview failed, falling back to mammoth', err);
+      pgToast('Full-formatting import unavailable — importing with basic formatting', 5000);
+    }
+    return await pgDocxViaMammoth(file);
+  }
+
+  async function pgDocxRenderFaithful(file) {
+    // docx-preview needs JSZip, which the hub already uses elsewhere.
+    await loadScriptOnce('https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js');
+    await loadScriptOnce('https://cdn.jsdelivr.net/npm/docx-preview@0.3.7/dist/docx-preview.min.js');
+    if (!window.docx || typeof window.docx.renderAsync !== 'function') return null;
+
+    const bodyEl = document.createElement('div');
+    const styleEl = document.createElement('div');
+    await window.docx.renderAsync(file, bodyEl, styleEl, {
+      className: 'wdoc',
+      inWrapper: false,          // our own page sheet is the wrapper
+      ignoreWidth: true,         // flow into that sheet rather than Word's page width
+      ignoreHeight: true,
+      ignoreFonts: false,        // keep the document's typefaces
+      breakPages: false,
+      ignoreLastRenderedPageBreak: true,
+      useBase64URL: true,        // blob: URLs die on reload — inline the images
+      renderHeaders: false,
+      renderFooters: false,
+      trimXmlDeclaration: true
+    });
+
+    // Word can carry embedded objects that come through as frames with no
+    // source. An empty src resolves back to index.html, which Chrome refuses to
+    // load in a frame from a file:// page — hence the "unique security origins"
+    // error. None of it is content worth keeping, so drop it here.
+    bodyEl.querySelectorAll('iframe, frame, object, embed').forEach(el => el.remove());
+    bodyEl.querySelectorAll('img').forEach(img => {
+      const src = img.getAttribute('src');
+      if (!src || !src.trim()) img.remove();       // would render as a broken image
+    });
+    bodyEl.querySelectorAll('[src=""], [href=""]').forEach(el => {
+      el.removeAttribute('src');
+      el.removeAttribute('href');
+    });
+
+    const html = (bodyEl.innerHTML || '').trim();
+    if (!html) return null;
+    // styleEl holds <style> blocks whose rules are scoped under .wdoc — that
+    // stylesheet carries the document's sizes, colours, fonts and table styling.
+    const css = styleEl.innerHTML || '';
+    console.info('[wiki] docx imported with full formatting (' +
+                 Math.round((css.length + html.length) / 1024) + 'KB, ' +
+                 (css ? 'stylesheet kept' : 'no stylesheet') + ')');
+    return css + '\n<div class="wdoc">' + html + '</div>';
+  }
+
+  async function pgDocxViaMammoth(file) {
+    await pgLoadUploadLibs();
+    if (!window.mammoth) throw new Error('docx converter not loaded');
+    const arrayBuffer = await file.arrayBuffer();
+
+    // Mammoth keeps semantic structure and drops direct formatting by default.
+    // This map pulls back the parts Word users actually rely on.
+    const styleMap = [
+      "u => u",
+      "strike => s",
+      "p[style-name='Title'] => h1:fresh",
+      "p[style-name='Subtitle'] => h2:fresh",
+      "p[style-name='Quote'] => blockquote:fresh",
+      "p[style-name='Intense Quote'] => blockquote:fresh"
+    ];
+
+    let result;
+    try {
+      result = await mammoth.convertToHtml({ arrayBuffer }, { styleMap, includeDefaultStyleMap: true });
+    } catch (e) {
+      // A style map this browser's mammoth build dislikes shouldn't lose the import.
+      console.warn('docx style map rejected, falling back to defaults', e);
+      result = await mammoth.convertToHtml({ arrayBuffer });
+    }
+
+    let html = (result && result.value) || '';
+    html = pgTidyDocxHtml(html);
+    if (!/<h1[\s>]/i.test(html)) {
+      html = '<h1>' + esc(pgTitleFromFilename(file.name)) + '</h1>\n' + html;
+    }
+    return html;
+  }
+
+  // Cleans up the debris Word tends to leave behind.
+  function pgTidyDocxHtml(html) {
+    return html
+      // Headings Word left empty because the text lived in a nested list.
+      .replace(/<(h[1-6])>(\s|&nbsp;|<br\s*\/?>)*<\/\1>/gi, '')
+      // A heading whose entire content is bold is just a heading.
+      .replace(/<(h[1-6])>\s*<strong>([\s\S]*?)<\/strong>\s*<\/\1>/gi, '<$1>$2</$1>')
+      .replace(/<p>(\s|&nbsp;)*<\/p>/gi, '')
+      .trim();
+  }
+
+  // ── PDF → Markdown, layout-aware ────────────────────────
+  // Rather than dumping every text run into one blob, this reconstructs the
+  // visual structure of the PDF: lines are rebuilt from glyph positions,
+  // headings are inferred from relative font size, bold/italic runs are
+  // detected from the embedded font names, lists keep their bullets/numbers,
+  // centered lines stay centered, and paragraph breaks come from vertical gaps.
+  function pgPdfFontFlags(page, content) {
+    const flags = {};
+    const names = new Set((content.items || []).map(it => it.fontName).filter(Boolean));
+    names.forEach(fn => {
+      let nm = '';
+      try {
+        const f = page.commonObjs.get(fn);
+        nm = (f && (f.name || f.loadedName)) || '';
+      } catch (e) { /* font object not resolved — fall back to style info */ }
+      if (!nm) nm = (content.styles && content.styles[fn] && content.styles[fn].fontFamily) || '';
+      flags[fn] = {
+        bold: /bold|black|heavy|semibold|demibold/i.test(nm),
+        italic: /italic|oblique/i.test(nm)
+      };
+    });
+    return flags;
+  }
+
+  // Turns the positioned glyph runs of one line into Markdown, merging adjacent
+  // runs that share styling and inserting spaces where the PDF left a visual gap.
+  function pgPdfLineToMarkdown(items) {
+    let out = '', buf = '', bufBold = false, bufItalic = false, prev = null;
+    const flush = () => {
+      if (!buf) return;
+      const core = buf.trim();
+      if (core) {
+        let wrapped = core;
+        if (bufBold) wrapped = '**' + wrapped + '**';
+        if (bufItalic) wrapped = '*' + wrapped + '*';
+        out += (/\s$/.test(out) || !out ? '' : ' ') + wrapped + (/\s$/.test(buf) ? ' ' : '');
+      } else if (buf && out && !/\s$/.test(out)) out += ' ';
+      buf = '';
+    };
+    items.forEach(it => {
+      let s = it.str;
+      if (!s) return;
+      if (prev) {
+        const gap = it.x - (prev.x + prev.w);
+        if (gap > Math.max(1, prev.size * 0.2) && !/\s$/.test(buf) && !/^\s/.test(s)) s = ' ' + s;
+      }
+      if (buf && (it.bold !== bufBold || it.italic !== bufItalic)) flush();
+      if (!buf) { bufBold = it.bold; bufItalic = it.italic; }
+      buf += s;
+      prev = it;
+    });
+    flush();
+    return out.replace(/\s+/g, ' ').trim();
+  }
+
+  async function pgPdfPageLines(page) {
+    const content = await page.getTextContent();
+    const flags = pgPdfFontFlags(page, content);
+    const viewport = page.getViewport({ scale: 1 });
+    const lines = [];
+    (content.items || []).forEach(it => {
+      if (!it.str || !it.str.trim()) return;
+      const x = it.transform[4], y = it.transform[5];
+      const size = Math.abs(it.transform[3]) || it.height || 10;
+      const f = flags[it.fontName] || {};
+      let line = lines.find(l => Math.abs(l.y - y) <= Math.max(1.5, size * 0.4));
+      if (!line) { line = { y, items: [] }; lines.push(line); }
+      line.items.push({ str: it.str, x, w: it.width || 0, size, bold: !!f.bold, italic: !!f.italic });
+    });
+    lines.forEach(l => {
+      l.items.sort((a, b) => a.x - b.x);
+      l.size = Math.max.apply(null, l.items.map(i => i.size));
+      l.x = Math.min.apply(null, l.items.map(i => i.x));
+      l.right = Math.max.apply(null, l.items.map(i => i.x + i.w));
+      l.allBold = l.items.every(i => i.bold);
+      l.text = pgPdfLineToMarkdown(l.items);
+    });
+    lines.sort((a, b) => b.y - a.y);
+    return { lines: lines.filter(l => l.text), pageWidth: viewport.width };
+  }
+
+  // Scanned pages have no extractable text — embed a rendered image so the page
+  // still looks like the original instead of coming through blank.
+  async function pgPdfPageToImage(page) {
+    const viewport = page.getViewport({ scale: 1.5 });
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(viewport.width);
+    canvas.height = Math.round(viewport.height);
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    await page.render({ canvasContext: ctx, viewport }).promise;
+    return canvas.toDataURL('image/jpeg', 0.72);
+  }
+
+  async function pgPdfToMarkdown(file) {
+    await pgLoadUploadLibs();
+    if (!window.pdfjsLib) throw new Error('pdf converter not loaded');
+    const arrayBuffer = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+
+    // Pass 1: read every page, and work out the document's body text size so
+    // heading detection compares against the actual body copy, not a guess.
+    const pageData = [];
+    const sizeWeight = {};
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const data = await pgPdfPageLines(page);
+      data.page = page;
+      pageData.push(data);
+      data.lines.forEach(l => {
+        const key = Math.round(l.size * 2) / 2;
+        sizeWeight[key] = (sizeWeight[key] || 0) + l.text.length;
+      });
+    }
+    let bodySize = 0, bestWeight = -1;
+    Object.keys(sizeWeight).forEach(k => {
+      if (sizeWeight[k] > bestWeight) { bestWeight = sizeWeight[k]; bodySize = parseFloat(k); }
+    });
+    if (!bodySize) bodySize = 11;
+
+    // Pass 2: turn each page's lines into Markdown blocks.
+    let md = '';
+    let titleUsed = false;
+    for (let i = 0; i < pageData.length; i++) {
+      const { lines, pageWidth, page } = pageData[i];
+      if (i > 0) md += '\n---\n\n';
+
+      if (!lines.length) {
+        try {
+          md += '![Page ' + (i + 1) + '](' + (await pgPdfPageToImage(page)) + ')\n\n';
+        } catch (e) { console.warn('page render failed', e); }
+        continue;
+      }
+
+      let para = null, prevLine = null;
+      const flushPara = () => {
+        if (para && para.text.trim()) md += para.text.trim() + '\n\n';
+        para = null;
+      };
+      lines.forEach((l, idx) => {
+        const ratio = l.size / bodySize;
+        const bulletMatch = l.text.match(/^([•●○▪◦*•●◦▪]|-)\s+(.*)$/);
+        const numberMatch = l.text.match(/^(\d{1,2})[.)]\s+(.*)$/);
+        const isHeading = ratio >= 1.14 || (l.allBold && ratio >= 1.02 && l.text.length < 90);
+        const gap = prevLine ? (prevLine.y - l.y) : 0;
+        const newBlock = !prevLine || gap > l.size * 1.75;
+        // A short line centred on the page is treated as centred text.
+        const centre = (l.x + l.right) / 2;
+        const isCentered = pageWidth > 0 && l.x > pageWidth * 0.12 &&
+          Math.abs(centre - pageWidth / 2) < pageWidth * 0.06 &&
+          (l.right - l.x) < pageWidth * 0.75;
+
+        if (isHeading || bulletMatch || numberMatch || newBlock) flushPara();
+
+        const nextText = (lines[idx + 1] || {}).text || '';
+        const nextIsListItem = /^([•●○▪◦*-]|\d{1,2}[.)])\s/.test(nextText);
+
+        if (bulletMatch) {
+          md += '- ' + bulletMatch[2].trim() + '\n' + (nextIsListItem ? '' : '\n');
+        } else if (numberMatch) {
+          md += numberMatch[1] + '. ' + numberMatch[2].trim() + '\n' + (nextIsListItem ? '' : '\n');
+        } else if (isHeading) {
+          let level = ratio >= 1.7 ? 1 : ratio >= 1.38 ? 2 : ratio >= 1.18 ? 3 : 4;
+          if (level === 1 && titleUsed) level = 2;
+          if (level === 1) titleUsed = true;
+          const heading = l.text.replace(/^\*+|\*+$/g, '').trim();
+          md += (isCentered
+            ? '<h' + level + ' style="text-align:center">' + heading + '</h' + level + '>'
+            : '#'.repeat(level) + ' ' + heading) + '\n\n';
+        } else if (isCentered) {
+          md += '<p style="text-align:center">' + l.text + '</p>\n\n';
+        } else {
+          // Continuation of the current paragraph — PDFs hard-wrap every line,
+          // so re-join them unless the vertical gap says otherwise.
+          if (!para) para = { text: l.text };
+          else para.text += ' ' + l.text;
+        }
+        prevLine = l;
+      });
+      flushPara();
+    }
+
+    md = md.replace(/\n{3,}/g, '\n\n').trim();
+    return md.match(/^\s*#\s+/) ? md : '# ' + pgTitleFromFilename(file.name) + '\n\n' + md;
+  }
+
+  async function pgHandleUpload(fileList) {
+    // A FileList, not an array — copy it before doing anything array-ish.
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    if (!pgCan('upload')) return pgRequire('upload');
+
+    const imported = [];
+    const failed = [];
+    const folder = pgFolder;   // import into the folder being browsed
+    for (const file of files) {
+      pgToast('Converting ' + file.name + '…', 120000);
+      try {
+        const ext = (file.name.split('.').pop() || '').toLowerCase();
+        let info;
+        if (ext === 'md' || ext === 'markdown') {
+          // Google can't read Markdown — render it here, then convert the HTML.
+          const html = await pgConvertToHtml(file);
+          info = await pgCall('createDoc', folder, pgTitleFromFilename(file.name), html);
+        } else {
+          // Everything else goes to Google as-is; its converter keeps Word
+          // formatting better than the browser can.
+          info = await pgCall('importFile', folder, file.name, await pgFileToBase64(file));
+        }
+        imported.push(pgAddCreatedPage(info, null));
+      } catch (err) {
+        console.error('import failed:', file.name, err);
+        failed.push({ name: file.name, error: pgErrMsg(err) });
+      }
+    }
+
+    pgSortPages();
+    pgRenderSidebar(pgSearchValue());
+
+    // Only claim success when something actually landed.
+    if (imported.length && !failed.length) {
+      pgToast(imported.length === 1
+        ? 'Imported "' + imported[imported.length - 1].title + '"'
+        : 'Imported ' + imported.length + ' documents');
+      pgOpenPage(imported[imported.length - 1]);
+      return;
+    }
+    pgShowUploadReport(imported, failed);
+  }
+
+  function pgFileToBase64(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onerror = () => reject(new Error('could not read ' + file.name));
+      reader.onload = () => resolve(String(reader.result).replace(/^data:[^,]*,/, ''));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  // Failures deserve more than a toast that disappears — this stays on screen
+  // with the real reason and what to do about it.
+  function pgShowUploadReport(imported, failed) {
+    const contentEl = document.getElementById('wgtContent');
+    if (failed.length) pgToast(failed.length + ' import' + (failed.length === 1 ? '' : 's') + ' failed', 6000);
+    if (!contentEl) return;
+
+    const guess = (msg) => {
+      const m = (msg || '').toLowerCase();
+      if (m.includes('edit access') || m.includes('read-only')) return 'Ask the wiki\'s owner to give you edit access.';
+      if (m.includes('10 mb')) return 'Try a version of the document with smaller or fewer images.';
+      if (m.includes('not loaded') || m.includes('converter')) return 'The converter is loaded from the internet on first use — check your connection and try again.';
+      if (m.includes('unsupported')) return 'Supported: Word, PDF, text, Markdown, HTML (→ Doc); Excel, CSV (→ Sheet); PowerPoint (→ Slides).';
+      return 'The full error is in the browser console (F12).';
+    };
+
+    contentEl.innerHTML = `
+      <div class="wgt-welcome">
+        <h3>${failed.length ? "Couldn't import " + (failed.length === 1 ? 'that file' : failed.length + ' files') : 'Import finished'}</h3>
+        ${imported.length ? `<p>${imported.length} page${imported.length === 1 ? '' : 's'} imported successfully.</p>` : ''}
+        ${failed.map(f => `
+          <p class="wgt-upload-fail"><strong>${esc(f.name)}</strong><br>${esc(f.error)}</p>
+          <p class="wgt-welcome-hint">${guess(f.error)}</p>`).join('')}
+        ${imported.length ? `<button class="wgt-btn wgt-primary" id="wgtOpenImported">Open imported page</button>` : ''}
+      </div>`;
+    const btn = document.getElementById('wgtOpenImported');
+    if (btn && imported.length) btn.addEventListener('click', () => pgOpenPage(imported[imported.length - 1]));
+  }
+
+  // ── Highlight/comment text-anchoring engine ─────────────
+  function pgBuildTextMap(root) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+    const map = []; let full = ''; let n;
+    while ((n = walker.nextNode())) { const start = full.length; full += n.nodeValue; map.push({ node: n, start, end: full.length }); }
+    return { full, map };
+  }
+  function pgLocateQuote(full, map, quote, prefix, suffix) {
+    if (!quote) return null;
+    let searchFrom = 0, best = null;
+    while (true) {
+      const idx = full.indexOf(quote, searchFrom);
+      if (idx === -1) break;
+      const before = full.slice(Math.max(0, idx - (prefix || '').length), idx);
+      const after = full.slice(idx + quote.length, idx + quote.length + (suffix || '').length);
+      const score = (before === (prefix || '') ? 1 : 0) + (after === (suffix || '') ? 1 : 0);
+      if (!best || score > best.score) best = { idx, score };
+      if (score === 2) break;
+      searchFrom = idx + 1;
+    }
+    if (!best) return null;
+    return pgOffsetsToRange(map, best.idx, best.idx + quote.length);
+  }
+  function pgOffsetsToRange(map, start, end) {
+    let startNode = null, startOffset = 0, endNode = null, endOffset = 0;
+    for (const m of map) {
+      if (startNode === null && start >= m.start && start <= m.end) { startNode = m.node; startOffset = start - m.start; }
+      if (end >= m.start && end <= m.end) { endNode = m.node; endOffset = end - m.start; break; }
+    }
+    if (!startNode || !endNode) return null;
+    return { startNode, startOffset, endNode, endOffset };
+  }
+  function pgTryWrap(container, quote, prefix, suffix, makeWrapper) {
+    if (!quote) return false;
+    const { full, map } = pgBuildTextMap(container);
+    const loc = pgLocateQuote(full, map, quote, prefix, suffix);
+    if (!loc) return false;
+    try {
+      const range = document.createRange();
+      range.setStart(loc.startNode, loc.startOffset);
+      range.setEnd(loc.endNode, loc.endOffset);
+      const wrapper = makeWrapper(range.extractContents());
+      range.insertNode(wrapper);
+      return true;
+    } catch (e) { console.warn("Couldn't anchor annotation", e); return false; }
+  }
+  // ── Find in this page ───────────────────────────────────
+  // A Ctrl+F style search scoped to the open document: highlights every match,
+  // steps through them, and leaves the page exactly as it found it on close.
+  let pgFindMatches = [];
+  let pgFindIndex = -1;
+
+  function pgFindReset() {
+    pgFindMatches = [];
+    pgFindIndex = -1;
+  }
+
+  // Unwraps our own <mark>s and stitches the split text nodes back together, so
+  // the annotation engine still sees the original DOM.
+  function pgFindClearMarks() {
+    const view = document.getElementById('wgtView');
+    if (!view) return;
+    view.querySelectorAll('mark.wgt-find').forEach(m => {
+      const parent = m.parentNode;
+      if (!parent) return;
+      while (m.firstChild) parent.insertBefore(m.firstChild, m);
+      parent.removeChild(m);
+      parent.normalize();
+    });
+    pgFindReset();
+  }
+
+  function pgFindRun(query) {
+    pgFindClearMarks();
+    const view = document.getElementById('wgtView');
+    const bar = document.getElementById('wgtFindBar');
+    const q = (query || '').trim();
+    if (!view || !bar) return;
+    const countEl = document.getElementById('wgtFindCount');
+    if (!q) {
+      if (countEl) countEl.textContent = '';
+      bar.classList.remove('wgt-find-none');
+      return;
+    }
+
+    // Collect text nodes first — wrapping as we walk would invalidate the walker.
+    const walker = document.createTreeWalker(view, NodeFilter.SHOW_TEXT, {
+      acceptNode: (n) => (n.nodeValue && n.nodeValue.trim() && n.parentElement &&
+                          !/^(SCRIPT|STYLE)$/.test(n.parentElement.nodeName))
+        ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT
+    });
+    const nodes = [];
+    let n;
+    while ((n = walker.nextNode())) nodes.push(n);
+
+    const needle = q.toLowerCase();
+    nodes.forEach(node => {
+      const text = node.nodeValue;
+      const hay = text.toLowerCase();
+      let from = 0, at;
+      const cuts = [];
+      while ((at = hay.indexOf(needle, from)) !== -1) {
+        cuts.push(at);
+        from = at + needle.length;
+      }
+      if (!cuts.length) return;
+      // Split back-to-front so earlier offsets stay valid.
+      let current = node;
+      for (let i = cuts.length - 1; i >= 0; i--) {
+        const start = cuts[i];
+        const tail = current.splitText(start);
+        tail.splitText(needle.length);
+        const mark = document.createElement('mark');
+        mark.className = 'wgt-find';
+        tail.parentNode.replaceChild(mark, tail);
+        mark.appendChild(tail);
+      }
+    });
+
+    // Read them back from the DOM so they come out in document order.
+    pgFindMatches = Array.prototype.slice.call(view.querySelectorAll('mark.wgt-find'));
+    bar.classList.toggle('wgt-find-none', pgFindMatches.length === 0);
+    if (pgFindMatches.length) pgFindGo(0);
+    else if (countEl) countEl.textContent = 'No results';
+  }
+
+  function pgFindGo(index) {
+    if (!pgFindMatches.length) return;
+    const wrapped = (index + pgFindMatches.length) % pgFindMatches.length;
+    pgFindMatches.forEach(m => m.classList.remove('wgt-find-current'));
+    pgFindIndex = wrapped;
+    const el = pgFindMatches[wrapped];
+    el.classList.add('wgt-find-current');
+    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    const countEl = document.getElementById('wgtFindCount');
+    if (countEl) countEl.textContent = (wrapped + 1) + ' of ' + pgFindMatches.length;
+  }
+
+  function pgFindOpen(prefill) {
+    const bar = document.getElementById('wgtFindBar');
+    if (!bar) return;
+    bar.classList.add('wgt-open');
+    const input = document.getElementById('wgtFindInput');
+    if (!input) return;
+    if (prefill) input.value = prefill;
+    input.focus();
+    input.select();
+    if (input.value) pgFindRun(input.value);
+  }
+
+  function pgFindClose() {
+    const bar = document.getElementById('wgtFindBar');
+    pgFindClearMarks();
+    if (!bar) return;
+    bar.classList.remove('wgt-open', 'wgt-find-none');
+    const countEl = document.getElementById('wgtFindCount');
+    if (countEl) countEl.textContent = '';
+  }
+
+  function pgWireFindBar() {
+    const bar = document.getElementById('wgtFindBar');
+    if (!bar) return;
+    const input = document.getElementById('wgtFindInput');
+    let timer = null;
+    if (input) {
+      input.addEventListener('input', () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => pgFindRun(input.value), 150);
+      });
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); pgFindGo(pgFindIndex + (e.shiftKey ? -1 : 1)); }
+        if (e.key === 'Escape') { e.preventDefault(); pgFindClose(); }
+      });
+    }
+    const prev = document.getElementById('wgtFindPrev');
+    const next = document.getElementById('wgtFindNext');
+    const close = document.getElementById('wgtFindClose');
+    if (prev) prev.addEventListener('click', () => pgFindGo(pgFindIndex - 1));
+    if (next) next.addEventListener('click', () => pgFindGo(pgFindIndex + 1));
+    if (close) close.addEventListener('click', pgFindClose);
+  }
+
+  function pgApplyAnnotations(page) {
+    const view = document.getElementById('wgtView');
+    if (!view) return;
+    const anns = page.annotations || { highlights: [], comments: [] };
+    anns.highlights.forEach(h => {
+      pgTryWrap(view, h.quote, h.prefix, h.suffix, (frag) => {
+        const mark = document.createElement('mark');
+        mark.className = 'wgt-hl wgt-hl-' + (h.color || 'yellow');
+        mark.dataset.hid = h.id;
+        mark.appendChild(frag);
+        return mark;
+      });
+    });
+    anns.comments.forEach(c => {
+      pgTryWrap(view, c.quote, c.prefix, c.suffix, (frag) => {
+        const span = document.createElement('span');
+        span.className = 'wgt-commented' + (c.resolved ? ' wgt-resolved-anchor' : '');
+        span.dataset.cid = c.id;
+        span.appendChild(frag);
+        return span;
+      });
+    });
+  }
+
+  // ── Selection toolbar / highlight menu / comment popup ──
+  function pgGetSelectionInfo() {
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0) return null;
+    const range = sel.getRangeAt(0);
+    const view = document.getElementById('wgtView');
+    if (!view || !view.contains(range.commonAncestorContainer)) return null;
+    const quote = sel.toString();
+    if (!quote.trim()) return null;
+    const { full } = pgBuildTextMap(view);
+    const preRange = document.createRange();
+    preRange.selectNodeContents(view);
+    preRange.setEnd(range.startContainer, range.startOffset);
+    const startIdx = preRange.toString().length;
+    const endIdx = startIdx + quote.length;
+    return {
+      quote,
+      prefix: full.slice(Math.max(0, startIdx - 40), startIdx),
+      suffix: full.slice(endIdx, endIdx + 40),
+      rect: range.getBoundingClientRect()
+    };
+  }
+  function pgPositionFloating(elm, rect) {
+    elm.style.display = 'flex';
+    const top = rect.top - elm.offsetHeight - 8;
+    const left = rect.left + rect.width / 2 - elm.offsetWidth / 2;
+    elm.style.top = Math.max(8, top) + 'px';
+    elm.style.left = Math.max(8, left) + 'px';
+  }
+  function pgHideSelToolbar() { const el = document.getElementById('wgtSelToolbar'); if (el) el.style.display = 'none'; }
+  function pgHideHighlightMenu() { const el = document.getElementById('wgtHlMenu'); if (el) el.style.display = 'none'; }
+  function pgHideCommentPopup() { const el = document.getElementById('wgtCommentPopup'); if (el) el.style.display = 'none'; pgPendingComment = null; }
+
+  function pgShowHighlightMenu(hlEl) {
+    const menu = document.getElementById('wgtHlMenu');
+    if (!menu) return;
+    menu.dataset.hid = hlEl.dataset.hid;
+    pgPositionFloating(menu, hlEl.getBoundingClientRect());
+  }
+
+  function pgAddHighlight(quote, prefix, suffix, color) {
+    const p = pgCurrent;
+    if (!p || !quote) return;
+    p.annotations.highlights.push({ id: pgGenId(), quote, prefix, suffix, color,
+                                    createdAt: Date.now(), author: pgUser.email || '' });
+    pgSaveAnnotations(p);
+    pgRenderPageView();
+  }
+  function pgChangeHighlightColor(id, color) {
+    const p = pgCurrent; if (!p) return;
+    const h = p.annotations.highlights.find(x => x.id === id); if (!h) return;
+    h.color = color; pgSaveAnnotations(p); pgRenderPageView();
+  }
+  function pgRemoveHighlight(id) {
+    const p = pgCurrent; if (!p) return;
+    p.annotations.highlights = p.annotations.highlights.filter(x => x.id !== id);
+    pgSaveAnnotations(p); pgRenderPageView();
+  }
+  function pgAddComment(quote, prefix, suffix, text) {
+    const p = pgCurrent;
+    if (!p || !quote) return;
+    p.annotations.comments.push({ id: pgGenId(), quote, prefix, suffix, text, resolved: false,
+                                  createdAt: Date.now(), author: pgUser.email || '' });
+    pgSaveAnnotations(p);
+    pgRenderPageView();
+    pgShowCommentsPanel();
+  }
+  function pgSetCommentResolved(id, resolved) {
+    const p = pgCurrent; if (!p) return;
+    const c = p.annotations.comments.find(x => x.id === id); if (!c) return;
+    c.resolved = resolved; pgSaveAnnotations(p); pgRenderPageView(); pgRenderCommentsPanel();
+  }
+  function pgDeleteComment(id) {
+    const p = pgCurrent; if (!p) return;
+    pgDialog('Delete comment', [], () => {
+      p.annotations.comments = p.annotations.comments.filter(x => x.id !== id);
+      pgSaveAnnotations(p); pgRenderPageView(); pgRenderCommentsPanel();
+    }, { confirm: 'Delete', danger: true, intro: 'Delete this comment? This cannot be undone.' });
+  }
+
+  // ── Comments panel ───────────────────────────────────────
+  function pgShowCommentsPanel() {
+    if (!pgCurrent) return;
+    const panel = document.getElementById('wgtCommentsPanel');
+    if (!panel) return;
+    panel.classList.add('wgt-open');
+    document.body.classList.add('wk-cp-open');
+    pgRenderCommentsPanel();
+    // Comments on a Doc change outside the wiki — check again when the
+    // panel is opened, unless we only just did.
+    if (pgIsDocPage(pgCurrent)) pgLoadDocComments(pgCurrent, 10000);
+  }
+  function pgHideCommentsPanel() {
+    const panel = document.getElementById('wgtCommentsPanel');
+    if (panel) panel.classList.remove('wgt-open');
+    document.body.classList.remove('wk-cp-open');
+  }
+  function pgUpdateCommentBadge() {
+    const badge = document.getElementById('wgtCmtBadge');
+    if (!badge) return;
+    let count = 0;
+    if (pgIsDocPage(pgCurrent)) {
+      const cached = pgDocComments[pgCurrent.id];
+      count = cached && cached.list ? cached.list.filter(c => !c.resolved).length : 0;
+    } else if (pgCurrent && pgCurrent.annotations) {
+      count = pgCurrent.annotations.comments.filter(c => !c.resolved).length;
+    }
+    if (count > 0) { badge.style.display = 'inline-block'; badge.textContent = count; }
+    else badge.style.display = 'none';
+  }
+  function pgCommentItemHtml(c) {
+    return `<div class="wgt-cp-item${c.resolved ? ' wgt-resolved' : ''}" data-id="${c.id}" id="wgt-cp-item-${c.id}">
+      <div class="wgt-cp-quote">${esc(pgTruncate(c.quote, 80))}</div>
+      <div class="wgt-cp-text">${esc(c.text)}</div>
+      <div class="wgt-cp-meta">${c.author ? `<span class="wgt-cp-author">${esc(c.author.split('@')[0])}</span> · ` : ''}${pgFmtTime(c.createdAt)}</div>
+      <div class="wgt-cp-actions">
+        ${c.resolved ? `<button class="wgt-cp-reopen" data-id="${c.id}">Reopen</button>` : `<button class="wgt-cp-resolve" data-id="${c.id}">Resolve</button>`}
+        <button class="wgt-cp-delete" data-id="${c.id}">Delete</button>
+      </div>
+    </div>`;
+  }
+  function pgRenderCommentsPanel() {
+    const body = document.getElementById('wgtCpBody');
+    if (!body) return;
+    const p = pgCurrent;
+    if (!p) { body.innerHTML = '<div class="wgt-cp-empty">Open a page to see its comments.</div>'; return; }
+    if (pgIsDocPage(p)) return pgRenderDocComments(p, body);
+    if (!p.annotations) { body.innerHTML = '<div class="wgt-cp-empty">Loading comments…</div>'; return; }
+    const all = p.annotations.comments.slice().sort((a, b) => b.createdAt - a.createdAt);
+    const active = all.filter(c => !c.resolved);
+    const resolved = all.filter(c => c.resolved);
+    if (!all.length) { body.innerHTML = '<div class="wgt-cp-empty">No comments yet. Select any text in the page to add one.</div>'; return; }
+
+    let html = '<div class="wgt-cp-list">';
+    active.forEach(c => { html += pgCommentItemHtml(c); });
+    if (!active.length) html += '<div class="wgt-cp-empty">No open comments.</div>';
+    html += '</div>';
+    if (resolved.length) {
+      html += `<div class="wgt-cp-toggle-resolved" id="wgtCpToggleResolved">${pgShowResolved ? 'Hide' : 'Show'} resolved (${resolved.length})</div>`;
+      if (pgShowResolved) {
+        html += '<div class="wgt-cp-list">';
+        resolved.forEach(c => { html += pgCommentItemHtml(c); });
+        html += '</div>';
+      }
+    }
+    body.innerHTML = html;
+    body.querySelectorAll('.wgt-cp-resolve').forEach(b => b.addEventListener('click', () => pgSetCommentResolved(b.dataset.id, true)));
+    body.querySelectorAll('.wgt-cp-reopen').forEach(b => b.addEventListener('click', () => pgSetCommentResolved(b.dataset.id, false)));
+    body.querySelectorAll('.wgt-cp-delete').forEach(b => b.addEventListener('click', () => pgDeleteComment(b.dataset.id)));
+    body.querySelectorAll('.wgt-cp-item').forEach(item => item.addEventListener('click', (e) => {
+      if (e.target.closest('button')) return;
+      pgFlashAnchor(item.dataset.id);
+    }));
+    const toggleBtn = document.getElementById('wgtCpToggleResolved');
+    if (toggleBtn) toggleBtn.addEventListener('click', () => { pgShowResolved = !pgShowResolved; pgRenderCommentsPanel(); });
+  }
+  // The Comments button sits with the page's own buttons, beside Edit, so it
+  // is re-created with every page view and bound here each time.
+  function pgCommentsBtnHtml() {
+    return `<button type="button" class="wk-pa" id="wgtCommentsToggleBtn" title="Comments" aria-label="Comments">${PG_ICONS.comment}<span class="wk-pa-badge" id="wgtCmtBadge" style="display:none">0</span></button>`;
+  }
+  function pgBindCommentsBtn() {
+    const btn = document.getElementById('wgtCommentsToggleBtn');
+    if (btn) btn.addEventListener('click', () => {
+      const panel = document.getElementById('wgtCommentsPanel');
+      if (panel && panel.classList.contains('wgt-open')) pgHideCommentsPanel(); else pgShowCommentsPanel();
+    });
+  }
+
+  // ── Google Doc comments (read from Drive, shown in the panel) ──
+  const pgDocComments = {};   // page id -> { at, list, error, loading }
+
+  // Fetches a Doc's comments unless the cached copy is younger than maxAgeMs.
+  function pgLoadDocComments(p, maxAgeMs) {
+    const cached = pgDocComments[p.id];
+    if (cached && cached.loading) return cached.loading;
+    if (cached && !cached.error && maxAgeMs !== undefined && Date.now() - cached.at < maxAgeMs) return Promise.resolve();
+    const entry = pgDocComments[p.id] = Object.assign({}, cached || {}, { error: null });
+    const done = () => {
+      entry.loading = null;
+      if (pgCurrent !== p) return;
+      pgUpdateCommentBadge();
+      const panel = document.getElementById('wgtCommentsPanel');
+      if (panel && panel.classList.contains('wgt-open')) pgRenderCommentsPanel();
+    };
+    entry.loading = pgCall('getDocComments', p.id).then(res => {
+      entry.list = res.comments || [];
+      entry.at = Date.now();
+      done();
+    }, err => {
+      console.error(err);
+      entry.error = pgErrMsg(err);
+      entry.at = Date.now();
+      done();
+    });
+    if (pgCurrent === p) {
+      const panel = document.getElementById('wgtCommentsPanel');
+      if (panel && panel.classList.contains('wgt-open')) pgRenderCommentsPanel();
+    }
+    return entry.loading;
+  }
+
+  function pgDocCommentLink(p, c) {
+    return p.docUrl + (p.docUrl.indexOf('?') === -1 ? '?' : '&') + 'disco=' + encodeURIComponent(c.id);
+  }
+
+  function pgDocCommentHtml(p, c) {
+    const replies = (c.replies || []).filter(r => r.text);
+    return `<div class="wgt-cp-item${c.resolved ? ' wgt-resolved' : ''}">
+      ${c.quote ? `<div class="wgt-cp-quote">${esc(pgTruncate(c.quote, 120))}</div>` : ''}
+      <div class="wgt-cp-text">${esc(c.text)}</div>
+      <div class="wgt-cp-meta"><span class="wgt-cp-author">${esc(c.author)}</span> · ${pgFmtTime(c.created)}</div>
+      ${replies.length ? `<div class="wgt-cp-replies">${replies.map(r => `
+        <div class="wgt-cp-reply${r.action ? ' wgt-cp-reply-action' : ''}">
+          <div class="wgt-cp-text">${esc(r.text)}</div>
+          <div class="wgt-cp-meta"><span class="wgt-cp-author">${esc(r.author)}</span> · ${pgFmtTime(r.created)}</div>
+        </div>`).join('')}</div>` : ''}
+      <div class="wgt-cp-actions">
+        <a class="wgt-cp-open" href="${esc(pgDocCommentLink(p, c))}" target="_blank" rel="noopener"
+           title="Open the file at this comment to reply or resolve">↗ Open in Google</a>
+      </div>
+    </div>`;
+  }
+
+  function pgRenderDocComments(p, body) {
+    const cached = pgDocComments[p.id];
+    if (!cached || (!cached.list && !cached.error)) {
+      body.innerHTML = '<div class="wgt-cp-empty">Loading comments…</div>';
+      if (!cached) pgLoadDocComments(p);
+      return;
+    }
+    const refreshing = !!cached.loading;
+    let html = `<div class="wgt-cp-docbar">
+        <span>${cached.list ? cached.list.filter(c => !c.resolved).length + ' open' : ''}${refreshing ? ' · refreshing…' : ''}</span>
+        <button type="button" id="wgtCpRefresh" title="Check Google for new comments">↻ Refresh</button>
+      </div>`;
+    if (cached.error) {
+      html += `<div class="wgt-cp-empty wgt-upload-fail">${esc(cached.error)}</div>`;
+    } else {
+      const all = cached.list;
+      const active = all.filter(c => !c.resolved);
+      const resolved = all.filter(c => c.resolved);
+      if (!all.length) {
+        html += `<div class="wgt-cp-empty">No comments on this ${esc(pgNoun(p))} yet. To add one, click
+          <strong>✎ Edit</strong> and use Google's comment button.</div>`;
+      } else {
+        html += '<div class="wgt-cp-list">';
+        active.forEach(c => { html += pgDocCommentHtml(p, c); });
+        if (!active.length) html += '<div class="wgt-cp-empty">No open comments.</div>';
+        html += '</div>';
+        if (resolved.length) {
+          html += `<div class="wgt-cp-toggle-resolved" id="wgtCpToggleResolved">${pgShowResolved ? 'Hide' : 'Show'} resolved (${resolved.length})</div>`;
+          if (pgShowResolved) {
+            html += '<div class="wgt-cp-list">';
+            resolved.forEach(c => { html += pgDocCommentHtml(p, c); });
+            html += '</div>';
+          }
+        }
+        html += `<div class="wgt-cp-empty wgt-cp-foot">Reply to or resolve comments in <strong>✎ Edit</strong>
+          mode, or with “Open in Google”.</div>`;
+      }
+    }
+    body.innerHTML = html;
+    const refresh = document.getElementById('wgtCpRefresh');
+    if (refresh) refresh.addEventListener('click', () => pgLoadDocComments(p, 0));
+    const toggleBtn = document.getElementById('wgtCpToggleResolved');
+    if (toggleBtn) toggleBtn.addEventListener('click', () => { pgShowResolved = !pgShowResolved; pgRenderCommentsPanel(); });
+  }
+
+  function pgFocusComment(cid) {
+    pgShowCommentsPanel();
+    pgFlashAnchor(cid);
+    const item = document.getElementById('wgt-cp-item-' + cid);
+    if (item) {
+      item.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      item.classList.add('wgt-flash');
+      setTimeout(() => item.classList.remove('wgt-flash'), 1000);
+    }
+  }
+  function pgFlashAnchor(cid) {
+    const anchor = document.querySelector(`#wgtView .wgt-commented[data-cid="${cid.replace(/[\x22\\]/g, '\\$&')}"]`);
+    if (anchor) {
+      anchor.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      anchor.classList.add('wgt-flash');
+      setTimeout(() => anchor.classList.remove('wgt-flash'), 1000);
+    }
+  }
+
+  // ── One-time global listeners (selection + click-away) ──
+  function pgBindGlobalListenersOnce() {
+    if (pgGlobalBound) return;
+    pgGlobalBound = true;
+
+    // Ctrl/Cmd+F searches the open page instead of the whole browser tab —
+    // but only while the wiki is on screen and not being edited, so the
+    // browser's own find still works everywhere else.
+    document.addEventListener('keydown', (e) => {
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'k' && !(pgEditing && !pgDocInline)) {
+        const box = document.getElementById('wgtSearch');
+        if (box && !box.disabled) { e.preventDefault(); box.focus(); box.select(); return; }
+      }
+      const shell = document.getElementById('wgtShell');
+      if (!shell || pgEditing || !pgCurrent || pgIsDocPage(pgCurrent)) return;
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
+        e.preventDefault();
+        const sel = window.getSelection();
+        const seed = sel && !sel.isCollapsed ? sel.toString().trim().slice(0, 80) : '';
+        pgFindOpen(seed);
+      }
+      if (e.key === 'Escape') {
+        const bar = document.getElementById('wgtFindBar');
+        if (bar && bar.classList.contains('wgt-open')) pgFindClose();
+      }
+    });
+
+    document.addEventListener('mouseup', (e) => {
+      if (pgEditing || !pgCurrent || pgIsDocPage(pgCurrent) || !pgCan('edit')) return;
+      if (e.target.closest('#wgtSelToolbar, #wgtCommentPopup, #wgtHlMenu')) return;
+      pgHideHighlightMenu();
+      const info = pgGetSelectionInfo();
+      const toolbar = document.getElementById('wgtSelToolbar');
+      if (!info || !toolbar) { pgHideSelToolbar(); return; }
+      toolbar.dataset.quote = info.quote;
+      toolbar.dataset.prefix = info.prefix;
+      toolbar.dataset.suffix = info.suffix;
+      pgPositionFloating(toolbar, info.rect);
+    });
+
+    document.addEventListener('mousedown', (e) => {
+      if (!e.target.closest('#wgtSelToolbar')) pgHideSelToolbar();
+      if (!e.target.closest('#wgtHlMenu, #wgtView mark.wgt-hl')) pgHideHighlightMenu();
+      if (!e.target.closest('#wgtCommentPopup, #wgtSelCommentBtn')) pgHideCommentPopup();
+    });
+  }
+
+  // ── Shell wiring (rebound on every render) ──────────────
+  function pgWireShell() {
+    const newPageBtn = document.getElementById('wgtNewPageBtn');
+    const uploadBtn = document.getElementById('wgtUploadBtn');
+    const fileInput = document.getElementById('wgtFileInput');
+    const cpCloseBtn = document.getElementById('wgtCpCloseBtn');
+    const searchInput = document.getElementById('wgtSearch');
+    const contentEl = document.getElementById('wgtContent');
+    const selToolbar = document.getElementById('wgtSelToolbar');
+    const hlMenu = document.getElementById('wgtHlMenu');
+    const commentPopup = document.getElementById('wgtCommentPopup');
+
+    const newFolderBtn = document.getElementById('wgtNewFolderBtn');
+    if (newFolderBtn) newFolderBtn.addEventListener('click', () => pgCreateFolder());
+    if (newPageBtn) newPageBtn.addEventListener('click', () => pgCreateNewPage());
+    const settingsBtn = document.getElementById('wkSettingsBtn');
+    if (settingsBtn) settingsBtn.addEventListener('click', () => {
+      const box = document.getElementById('wgtSearch');
+      if (box && box.value) { box.value = ''; pgRunSearch(''); }
+      pgShowSettings();
+    });
+    const linkDocBtn = document.getElementById('wgtLinkDocBtn');
+    if (linkDocBtn) linkDocBtn.addEventListener('click', () => pgLinkDoc());
+    if (uploadBtn) uploadBtn.addEventListener('click', () => fileInput && fileInput.click());
+    if (fileInput) fileInput.addEventListener('change', (e) => {
+      const files = Array.from(e.target.files || []);
+      e.target.value = '';
+      pgHandleUpload(files);
+    });
+    // The Comments button lives in each page's header — see pgCommentsBtnHtml.
+    if (cpCloseBtn) cpCloseBtn.addEventListener('click', pgHideCommentsPanel);
+    if (searchInput) searchInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && searchInput.value) {
+        e.preventDefault();
+        searchInput.value = '';
+        searchInput.dispatchEvent(new Event('input'));
+      }
+    });
+    if (searchInput) searchInput.addEventListener('input', () => {
+      pgRunSearch(searchInput.value);       // server text search, merged in when it lands
+      pgRenderSidebar(searchInput.value);
+      pgRenderSearchResults(searchInput.value);
+    });
+
+    if (contentEl) contentEl.addEventListener('click', (e) => {
+      const link = e.target.closest('[data-wikilink]');
+      if (link) {
+        e.preventDefault();
+        const target = decodeURIComponent(link.dataset.wikilink);
+        const existing = pgPages.find(p => p.title.toLowerCase() === target.toLowerCase());
+        if (existing) pgOpenPage(existing);
+        else if (pgCan('add')) {
+          pgDialog('Create page', [], () => pgDoCreateNewPage(target), {
+            confirm: 'Create page',
+            intro: '<strong>' + esc(target) + '</strong> doesn\'t exist yet. Create it in <strong>' +
+                   esc(pgFolderLabel(pgFolder)) + '</strong>?'
+          });
+        } else pgToast('That page doesn\'t exist yet');
+        return;
+      }
+      const hl = e.target.closest('#wgtView mark.wgt-hl');
+      if (hl) { e.stopPropagation(); pgShowHighlightMenu(hl); return; }
+      const cm = e.target.closest('#wgtView .wgt-commented');
+      if (cm) { e.stopPropagation(); pgFocusComment(cm.dataset.cid); return; }
+    });
+
+    if (selToolbar) {
+      selToolbar.querySelectorAll('.wgt-swatch').forEach(sw => {
+        sw.addEventListener('click', () => {
+          const color = sw.dataset.color;
+          const quote = selToolbar.dataset.quote, prefix = selToolbar.dataset.prefix, suffix = selToolbar.dataset.suffix;
+          pgHideSelToolbar();
+          window.getSelection().removeAllRanges();
+          pgAddHighlight(quote, prefix, suffix, color);
+        });
+      });
+      const cmtBtn = document.getElementById('wgtSelCommentBtn');
+      if (cmtBtn) cmtBtn.addEventListener('click', () => {
+        pgPendingComment = { quote: selToolbar.dataset.quote, prefix: selToolbar.dataset.prefix, suffix: selToolbar.dataset.suffix };
+        const rect = selToolbar.getBoundingClientRect();
+        pgHideSelToolbar();
+        if (!commentPopup) return;
+        const preview = document.getElementById('wgtCmtQuotePreview');
+        const input = document.getElementById('wgtCmtInput');
+        if (preview) preview.textContent = '"' + pgTruncate(pgPendingComment.quote, 100) + '"';
+        if (input) input.value = '';
+        commentPopup.style.display = 'block';
+        commentPopup.style.top = Math.max(8, rect.top) + 'px';
+        commentPopup.style.left = Math.max(8, Math.min(rect.left, window.innerWidth - 270)) + 'px';
+        if (input) input.focus();
+      });
+    }
+
+    if (commentPopup) {
+      const cancelBtn = document.getElementById('wgtCmtCancelBtn');
+      const submitBtn = document.getElementById('wgtCmtSubmitBtn');
+      if (cancelBtn) cancelBtn.addEventListener('click', pgHideCommentPopup);
+      if (submitBtn) submitBtn.addEventListener('click', () => {
+        const input = document.getElementById('wgtCmtInput');
+        const text = input ? input.value.trim() : '';
+        if (!text || !pgPendingComment) return;
+        pgAddComment(pgPendingComment.quote, pgPendingComment.prefix, pgPendingComment.suffix, text);
+        pgHideCommentPopup();
+      });
+    }
+
+    if (hlMenu) {
+      hlMenu.querySelectorAll('.wgt-swatch').forEach(sw => {
+        sw.addEventListener('click', () => { pgChangeHighlightColor(hlMenu.dataset.hid, sw.dataset.color); pgHideHighlightMenu(); });
+      });
+      const trashBtn = document.getElementById('wgtHlDeleteBtn');
+      if (trashBtn) trashBtn.addEventListener('click', () => { pgRemoveHighlight(hlMenu.dataset.hid); pgHideHighlightMenu(); });
+    }
+  }
+
+  // ── Header tools: search and page actions ───────────────
+  // They live in the app's top bar (#wkTools in Index.html) rather than in a
+  // toolbar row inside the wiki, which gives the pages that row back.
+  const pgIcon = d => '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + d + '</svg>';
+  const PG_ICONS = {
+    search: pgIcon('<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>'),
+    plus: pgIcon('<path d="M12 5v14M5 12h14"/>'),
+    folder: pgIcon('<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M12 10v6M9 13h6"/>'),
+    link: pgIcon('<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>'),
+    upload: pgIcon('<path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>'),
+    eye: pgIcon('<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>'),
+    pen: pgIcon('<path d="M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16v4z"/><path d="m13.5 6.5 4 4"/>'),
+    comment: pgIcon('<path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/>'),
+    external: pgIcon('<path d="M14 4h6v6M20 4l-9 9"/><path d="M19 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5"/>'),
+    trash: pgIcon('<path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/>'),
+    unlink: pgIcon('<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/><path d="M4 4l16 16"/>'),
+    check: pgIcon('<path d="m5 12 5 5L20 7"/>'),
+    doc: pgIcon('<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h4"/>'),
+    sheet: pgIcon('<rect x="4" y="3" width="16" height="18" rx="2"/><path d="M4 9h16M4 15h16M10 9v12"/>'),
+    slide: pgIcon('<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 10h10M7 14h6"/>'),
+    gear: pgIcon('<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>'),
+    lock: pgIcon('<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>'),
+    maximize: pgIcon('<path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>'),
+    restore: pgIcon('<path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/>'),
+    fullscreen: pgIcon('<path d="M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M16 21h3a2 2 0 0 0 2-2v-3"/>'),
+    exitFullscreen: pgIcon('<path d="M8 3v3a2 2 0 0 1-2 2H3M21 8h-3a2 2 0 0 1-2-2V3M3 16h3a2 2 0 0 1 2 2v3M16 21v-3a2 2 0 0 1 2-2h3"/>'),
+    page: pgIcon('<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>')
+  };
+
+  // ── Page header: title on the left, quiet icon actions + one primary ──
+  // Icon buttons carry their name in title/aria-label; only the primary action
+  // (Edit / Done) is spelled out.
+  function pgIconBtn(id, icon, label, extra) {
+    return `<button type="button" class="wk-pa${extra ? ' ' + extra : ''}" id="${id}" title="${esc(label)}" aria-label="${esc(label)}">${PG_ICONS[icon]}</button>`;
+  }
+  function pgPrimaryBtn(id, icon, label, title) {
+    return `<button type="button" class="wk-pa-primary" id="${id}" title="${esc(title || label)}">${PG_ICONS[icon]}<span>${esc(label)}</span></button>`;
+  }
+  // What kind of page this is, for icons and labels everywhere: which Google
+  // app it opens in (or an Office file), or the wiki's own .html/.md page.
+  function pgKindOf(p) {
+    if (p.kind === 'html') return { cls: 'page', icon: 'page', label: 'Wiki page' };
+    const base = p.office ? pgNoun(p) : pgAppInfo(p).name;
+    return { cls: p.app || 'doc', icon: pgAppInfo(p).icon, label: p.kind === 'link' ? 'Linked ' + base : base };
+  }
+  // Small icon: sidebar and search results.
+  function pgSideIcon(p) {
+    const k = pgKindOf(p);
+    return `<span class="wk-side-app wk-kind-${k.cls}" title="${esc(k.label)}">${PG_ICONS[k.icon]}</span>`;
+  }
+  // Tinted badge: page titles and the contents list.
+  function pgKindBadge(p) {
+    const k = pgKindOf(p);
+    return `<span class="wk-kind wk-kind-${k.cls}" title="${esc(k.label)}">${PG_ICONS[k.icon]}</span>`;
+  }
+
+  function pgPageTitleHtml(p) {
+    const crumb = p.folder
+      ? `<span class="wk-crumb">${esc(p.folder.split('/').join(' / '))}</span><span class="wk-crumb-sep">/</span>` : '';
+    return `<div class="wk-title">
+        ${pgKindBadge(p)}
+        <div class="wk-title-text">${crumb}<h2>${esc(p.title)}</h2></div>
+      </div>`;
+  }
+
+  function pgToolsHtml() {
+    const mac = /Mac|iPhone|iPad/.test(navigator.platform || '');
+    return `
+      <label class="wk-search" for="wgtSearch">
+        ${PG_ICONS.search}
+        <input id="wgtSearch" type="search" placeholder="Search pages, Docs, Sheets and Slides…" autocomplete="off" spellcheck="false" disabled />
+        <kbd class="wk-kbd" aria-hidden="true">${mac ? '⌘' : 'Ctrl'} K</kbd>
+      </label>
+      <div class="wk-actions">
+        <span class="wk-readonly" id="wgtReadonlyNote" style="display:none" title="Ask the wiki's owner for edit access">${PG_ICONS.eye}<span class="wk-label">Read-only</span></span>
+        <div class="wk-seg" id="wkEditTools">
+          <button class="wk-act" id="wgtNewFolderBtn" disabled title="New folder">${PG_ICONS.folder}<span class="wk-label">Folder</span></button>
+          <button class="wk-act" id="wgtLinkDocBtn" disabled title="Add an existing Google Doc, Sheet or Slides — or a Word, Excel or PowerPoint file in Drive">${PG_ICONS.link}<span class="wk-label">Link</span></button>
+          <button class="wk-act" id="wgtUploadBtn" disabled title="Upload Word, PDF or text (→ Doc), Excel or CSV (→ Sheet), PowerPoint (→ Slides)">${PG_ICONS.upload}<span class="wk-label">Upload</span></button>
+        </div>
+        <button class="wk-act wk-act-primary" id="wgtNewPageBtn" disabled title="Create a Google Doc page">${PG_ICONS.plus}<span class="wk-label">New page</span></button>
+        ${pgUser.isAdmin ? `<button class="wk-act wk-settings-btn" id="wkSettingsBtn" title="Settings — people and permissions" aria-label="Settings">${PG_ICONS.gear}</button>` : ''}
+        <input type="file" id="wgtFileInput" multiple accept=".docx,.doc,.odt,.rtf,.pdf,.txt,.md,.markdown,.html,.htm,.xlsx,.xls,.ods,.csv,.tsv,.pptx,.ppt,.odp" style="display:none" />
+      </div>`;
+  }
+
+  const PG_APP = {
+    async render(container) {
+      container.innerHTML = `
+        <div class="wgt-shell" id="wgtShell">
+          <div class="wgt-main">
+            <div class="wgt-sidebar" id="wgtSidebar"><div class="wgt-empty-hint">Loading pages…</div></div>
+            <div class="wgt-content" id="wgtContent">
+              <div class="wgt-welcome" id="wgtWelcome">
+                <h3>OIS Team Wiki</h3>
+                <p id="wgtWelcomeMsg">Loading pages…</p>
+              </div>
+            </div>
+            <div class="wgt-comments-panel" id="wgtCommentsPanel">
+              <div class="wgt-cp-header"><span>Comments</span><button id="wgtCpCloseBtn">✕</button></div>
+              <div id="wgtCpBody"></div>
+            </div>
+          </div>
+          <div id="wgtFindBar" class="wgt-find-bar">
+            <input id="wgtFindInput" type="text" placeholder="Find in this page…" />
+            <span class="wgt-find-count" id="wgtFindCount"></span>
+            <button class="wgt-find-btn" id="wgtFindPrev" title="Previous match (Shift+Enter)">↑</button>
+            <button class="wgt-find-btn" id="wgtFindNext" title="Next match (Enter)">↓</button>
+            <button class="wgt-find-btn" id="wgtFindClose" title="Close (Esc)">✕</button>
+          </div>
+        </div>
+        <div id="wgtTableTools" class="wgt-table-tools">
+          <span class="wgt-tt-label">Table</span>
+          <button class="wgt-tt-btn" data-tt="row-above" title="Insert row above">↥ Row</button>
+          <button class="wgt-tt-btn" data-tt="row-below" title="Insert row below">↧ Row</button>
+          <button class="wgt-tt-btn" data-tt="col-left" title="Insert column left">↤ Col</button>
+          <button class="wgt-tt-btn" data-tt="col-right" title="Insert column right">↦ Col</button>
+          <span class="wgt-tt-sep"></span>
+          <button class="wgt-tt-btn" data-tt="header" title="Toggle header row">Header</button>
+          <span class="wgt-tt-sep"></span>
+          <button class="wgt-tt-btn wgt-tt-danger" data-tt="del-row" title="Delete this row">✕ Row</button>
+          <button class="wgt-tt-btn wgt-tt-danger" data-tt="del-col" title="Delete this column">✕ Col</button>
+          <button class="wgt-tt-btn wgt-tt-danger" data-tt="del-table" title="Delete the whole table">🗑</button>
+        </div>
+        <div id="wgtSelToolbar" class="wgt-sel-toolbar">
+          <div class="wgt-swatch yellow" data-color="yellow" title="Highlight yellow"></div>
+          <div class="wgt-swatch green" data-color="green" title="Highlight green"></div>
+          <div class="wgt-swatch blue" data-color="blue" title="Highlight blue"></div>
+          <div class="wgt-swatch pink" data-color="pink" title="Highlight pink"></div>
+          <div class="wgt-sep"></div>
+          <button class="wgt-cmt-btn" id="wgtSelCommentBtn">💬 Comment</button>
+        </div>
+        <div id="wgtHlMenu" class="wgt-hl-menu">
+          <div class="wgt-swatch yellow" data-color="yellow"></div>
+          <div class="wgt-swatch green" data-color="green"></div>
+          <div class="wgt-swatch blue" data-color="blue"></div>
+          <div class="wgt-swatch pink" data-color="pink"></div>
+          <button class="wgt-trash" id="wgtHlDeleteBtn" title="Remove highlight">🗑</button>
+        </div>
+        <div id="wgtCommentPopup" class="wgt-comment-popup">
+          <div class="wgt-quote-preview" id="wgtCmtQuotePreview"></div>
+          <textarea id="wgtCmtInput" placeholder="Add a comment…"></textarea>
+          <div class="wgt-row">
+            <button class="wgt-btn" id="wgtCmtCancelBtn">Cancel</button>
+            <button class="wgt-btn wgt-primary" id="wgtCmtSubmitBtn">Comment</button>
+          </div>
+        </div>
+        <div class="wgt-toast" id="wgtToast"></div>
+      `;
+
+      const home = document.getElementById('wkHome');
+      if (home && !home.dataset.bound) {
+        home.dataset.bound = '1';
+        home.addEventListener('click', (e) => {
+          e.preventDefault();
+          const box = document.getElementById('wgtSearch');
+          if (box && box.value) { box.value = ''; pgRunSearch(''); }
+          pgShowHome();
+        });
+      }
+      const tools = document.getElementById('wkTools');
+      if (tools) tools.innerHTML = pgToolsHtml();
+      else container.insertAdjacentHTML('afterbegin', '<div class="wk-tools wk-tools-inline">' + pgToolsHtml() + '</div>');
+      pgEditing = false;
+      pgWireShell();
+      pgWireFindBar();
+      pgBindGlobalListenersOnce();
+      await pgLoadViewLibs();
+
+      if (BOOT.denied) {
+        const tools = document.getElementById('wkTools');
+        if (tools) tools.innerHTML = '';
+        pgShowDenied(container);
+        return;
+      }
+      if (BOOT.error) { pgShowLoadError(BOOT.error); return; }
+      await pgLoadPages();
+    }
+  };
+
+  // Other people edit the same wiki, so pick up their new pages and folders
+  // when the reader comes back to the tab — at most once a minute.
+  let pgLastRefresh = Date.now();
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible' || !pgLoaded || pgEditing) return;
+    // Back from editing a Doc: show the new version straight away, and pick up
+    // a changed title with it.
+    if (pgRefreshEditedDoc()) {
+      pgLastRefresh = Date.now();
+      pgLoadPages({ fresh: true, quiet: true });
+      return;
+    }
+    if (Date.now() - pgLastRefresh < 60000) return;
+    pgLastRefresh = Date.now();
+    pgLoadPages({ fresh: true, quiet: true });
+  });
+
+  PG_APP.render(document.getElementById('wkMain'));
+})();
+</script>

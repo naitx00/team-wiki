@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<base target="_top">
+<meta charset="UTF-8" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.2/Sortable.min.js"></script>
+<?!= include('Styles'); ?>
+<?!= brandCss ?>
+</head>
+<body>
+<header class="wk-top">
+  <a class="wk-brand" id="wkHome" href="#" title="<?= brand.name ?> — home">
+    <!-- Logo and name come from brand_() in Code.gs (Brand.gs if present). -->
+    <?!= brandLogo ?>
+    <span class="wk-brand-divider" aria-hidden="true"></span>
+    <span class="wk-brand-name"><?= brand.name ?></span>
+  </a>
+  <!-- The wiki's search and page actions render here (WikiClient). -->
+  <div class="wk-tools" id="wkTools"></div>
+  <span class="wk-user" id="wkUser"><span class="wk-avatar" id="wkAvatar"></span><span class="wk-user-text" id="wkUserText">…</span></span>
+  <button class="wk-icon-btn" id="wkTheme" title="Toggle light / dark theme" aria-label="Toggle light / dark theme"></button>
+</header>
+<main class="wk-main" id="wkMain"></main>
+
+<script>
+  // Server data rendered into the page by doGet(): the signed-in user and the
+  // folder/page list, so the first paint needs no round trip.
+  window.OIS_WIKI_BOOT = <?!= bootJson ?>;
+</script>
+<?!= include('Helpers'); ?>
+<?!= include('WikiClient'); ?>
+</body>
+</html>

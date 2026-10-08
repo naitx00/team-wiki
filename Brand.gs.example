@@ -1,0 +1,15 @@
+/* Brand.gs.example — copy to Brand.gs (gitignored) to brand the wiki.
+ *
+ * Every field is optional; anything left out falls back to the neutral
+ * default. Logos are data URIs because HtmlService serves no static files:
+ *   base64 -w0 logo.png   →   'data:image/png;base64,<output>'
+ * Keep them small (a 180×36 PNG is ~4 KB).
+ */
+const BRAND = {
+  name: 'Team Wiki',                    // header and welcome page
+  org: 'Example Co',                    // "Sign in with your Example Co Google account"
+  title: 'Team Wiki · Example Co',      // browser tab
+  logoLight: '',                        // logo on the light theme (dark ink)
+  logoDark: '',                         // logo on the dark theme (light ink)
+  css: ''                               // e.g. ':root{--accent:#0a7cff;--accent-2:#0060d0}'
+};

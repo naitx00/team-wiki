@@ -1,0 +1,7 @@
+# Only the Apps Script sources are pushed.
+**/**
+!appsscript.json
+!*.gs
+!*.html
+# Local tooling, never pushed.
+dev/**

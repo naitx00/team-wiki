@@ -1,0 +1,98 @@
+<script>
+/* Helpers.html — the few hub globals the wiki depends on, plus the bridge to
+ * the server. Loaded before WikiClient. */
+
+// ── Start-up diagnostics ──
+// If the wiki fails to start, say so on the page instead of leaving it blank.
+// WikiClient sets OIS_WIKI_STARTED as its first statement.
+window.OIS_WIKI_ERRORS = [];
+window.addEventListener('error', e => {
+  OIS_WIKI_ERRORS.push((e.message || 'Script error') + (e.lineno ? ' (line ' + e.lineno + ')' : ''));
+  showStartupProblem();
+});
+window.addEventListener('unhandledrejection', e => {
+  OIS_WIKI_ERRORS.push('Unhandled: ' + (e.reason && e.reason.message || e.reason));
+  showStartupProblem();
+});
+window.addEventListener('load', () => setTimeout(showStartupProblem, 1500));
+function showStartupProblem() {
+  const main = document.getElementById('wkMain');
+  if (!main || document.getElementById('wgtShell')) return;   // the wiki is up
+  const started = !!window.OIS_WIKI_STARTED;
+  const errs = window.OIS_WIKI_ERRORS;
+  if (started && !errs.length) return;                          // still starting
+  main.innerHTML = '<div class="wk-fatal"><h2>The wiki didn\'t start</h2>' +
+    '<p>' + (started ? 'The wiki script ran but stopped with an error.'
+                     : 'The wiki script (WikiClient) never ran — it is missing, incomplete, or failed to parse.') + '</p>' +
+    (errs.length ? '<pre style="white-space:pre-wrap;margin-top:12px;font-size:12px">' +
+      errs.map(esc).join('\n') + '</pre>' : '') + '</div>';
+}
+
+// Same as the hub's core/render.js.
+function esc(s) { return String(s).replace(/[&<>\x22\x27]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+// Same as the hub's tools/mockup-generator.js.
+function loadScriptOnce(url) {
+  if (document.querySelector(`script[data-lazy-src="${url}"]`)) {
+    return new Promise(r => r());
+  }
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = url;
+    s.dataset.lazySrc = url;
+    s.onload = resolve;
+    s.onerror = reject;
+    document.head.appendChild(s);
+  });
+}
+
+// google.script.run is callback-based; everything in the wiki is async/await.
+// pgCall('savePage', id, html, rev) resolves with the server function's result
+// and rejects with its Error.
+function pgCall(fn, ...args) {
+  return new Promise((resolve, reject) => {
+    google.script.run
+      .withSuccessHandler(resolve)
+      .withFailureHandler(err => reject(err instanceof Error ? err : new Error(String(err && err.message || err))))
+      [fn](...args);
+  });
+}
+
+// ── Theme (same storage key as the hub, so the choice carries over) ──
+(function () {
+  const KEY = 'ois-hub-theme';
+  const svg = d => '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
+    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + d + '</svg>';
+  const MOON = svg('<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>');
+  const SUN = svg('<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>');
+  const btn = document.getElementById('wkTheme');
+  function apply(theme) {
+    document.documentElement.setAttribute('data-theme', theme);
+    try { localStorage.setItem(KEY, theme); } catch (e) { /* storage blocked */ }
+    if (btn) btn.innerHTML = theme === 'dark' ? SUN : MOON;
+  }
+  let saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) { /* storage blocked */ }
+  apply(saved || (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+  if (btn) btn.addEventListener('click', () =>
+    apply(document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark'));
+})();
+
+// ── Signed-in account chip ──
+(function () {
+  const boot = window.OIS_WIKI_BOOT || {};
+  const user = boot.user || {};
+  const chip = document.getElementById('wkUser');
+  const text = document.getElementById('wkUserText');
+  if (!chip || !text) return;
+  text.textContent = user.email || 'Not signed in';
+  const avatar = document.getElementById('wkAvatar');
+  if (avatar) avatar.textContent = (user.email || '?').charAt(0).toUpperCase();
+  chip.classList.toggle('wk-can-edit', !!user.canEdit);
+  const org = (boot.brand && boot.brand.org) || '';
+  chip.title = !user.email ? 'Sign in with your ' + (org ? org + ' ' : 'work ') + 'Google account'
+    : user.isAdmin ? 'Signed in — admin (manages Settings)'
+    : user.canView === false ? 'Signed in — no access yet'
+    : user.canEdit ? 'Signed in — you can make changes' : 'Signed in — read-only access';
+})();
+</script>
